@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-REPO_RAW="https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/refs/heads/main"
+REPO_RAW="https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/main"
 BASE_DIR="/root/aliyun-traffic-control"
 SERVICE_NAME="traffic-control.service"
 

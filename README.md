@@ -5,7 +5,7 @@
 ## 安装
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/refs/heads/main/install.sh -o install.sh && bash install.sh
+curl -sSL https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/main/install.sh -o install.sh && bash install.sh
 ```
 
 首次安装只录入 Telegram 配置和第一个阿里云账号。
