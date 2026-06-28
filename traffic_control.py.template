@@ -653,8 +653,8 @@ def check_cron_job():
 
 def prompt(msg: str, default: Optional[str] = None, secret: bool = False) -> str:
     # secret 保留参数，避免额外依赖 getpass；root 终端录入简单直接。
-    if default is None:
-        val = input(msg).strip()
+    if default is None or default == '':
+        val = input(f'{msg}: ').strip()
     else:
         val = input(f'{msg}，默认 {default}: ').strip()
         if not val:
