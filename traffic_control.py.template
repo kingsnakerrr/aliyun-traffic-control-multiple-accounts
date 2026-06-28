@@ -688,23 +688,42 @@ def check_cron_job():
 # CLI 多账号管理
 # =========================
 
+class UserCancelled(Exception):
+    pass
+
 def prompt(msg: str, default: Optional[str] = None, secret: bool = False) -> str:
     # secret 保留参数，避免额外依赖 getpass；root 终端录入简单直接。
-    if default is None or default == '':
-        val = input(f'{msg}: ').strip()
-    else:
-        val = input(f'{msg}，默认 {default}: ').strip()
-        if not val:
-            val = default
-    return val
+    try:
+        if default is None or default == '':
+            val = input(f'{msg}: ').strip()
+        else:
+            val = input(f'{msg}，默认 {default}: ').strip()
+            if not val:
+                val = default
+        return val
+    except (KeyboardInterrupt, EOFError):
+        print('\n已取消当前操作，返回菜单。')
+        raise UserCancelled()
 
 
 def prompt_bool(msg: str, default: bool = False) -> bool:
     suffix = '默认 y' if default else '默认 n'
-    val = input(f'{msg}，输入 y/n，{suffix}: ').strip().lower()
+    try:
+        val = input(f'{msg}，输入 y/n，{suffix}: ').strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print('\n已取消当前操作，返回菜单。')
+        raise UserCancelled()
     if not val:
         return default
     return val in ['y', 'yes', '1', 'true', '是']
+
+
+def safe_input(msg: str) -> str:
+    try:
+        return input(msg).strip()
+    except (KeyboardInterrupt, EOFError):
+        print('\n已取消当前操作，返回菜单。')
+        raise UserCancelled()
 
 
 def build_account_from_prompt(existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -776,7 +795,7 @@ def account_selector_from_argv(default_prompt='请输入账号序号或名称: '
     accounts = load_accounts(include_disabled=True)
     if not accounts:
         return None
-    return input(default_prompt).strip()
+    return safe_input(default_prompt)
 
 
 def delete_account_cli():
@@ -791,7 +810,7 @@ def delete_account_cli():
     if not acc:
         print('没有找到这个账号。')
         return
-    confirm = input(f'确定删除账号 {account_name(acc)}？输入 yes 继续: ').strip()
+    confirm = safe_input(f'确定删除账号 {account_name(acc)}？输入 yes 继续: ')
     if confirm != 'yes':
         print('已取消。')
         return
@@ -1149,4 +1168,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except UserCancelled:
+        pass
+    except KeyboardInterrupt:
+        print('\n已取消当前操作，返回菜单。')
