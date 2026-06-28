@@ -85,6 +85,48 @@ account_menu(){
   done
 }
 
+telegram_menu(){
+  while true; do
+    clear
+    echo "=============================="
+    echo " TG Bot / 日志"
+    echo "=============================="
+    echo "1. 查看 TG Bot 服务状态"
+    echo "2. 启动 TG Bot 服务"
+    echo "3. 停止 TG Bot 服务"
+    echo "4. 重启 TG Bot 服务"
+    echo "5. 查看最近日志"
+    echo "6. 查看实时 cron 日志"
+    echo "7. 查看当前 crontab"
+    echo "8. 查看系统时间/时区"
+    echo "9. 查看通知状态文件"
+    echo "10. 查看 accounts.json"
+    echo "11. 手动编辑 accounts.json"
+    echo "12. 编辑主程序文件"
+    echo "13. 备份 accounts.json"
+    echo "0. 返回账号列表"
+    echo "=============================="
+    read -r -p "请输入选项: " c
+    case "$c" in
+      1) service_status; pause;;
+      2) start_bot; pause;;
+      3) stop_bot; pause;;
+      4) restart_bot; pause;;
+      5) show_last_logs; pause;;
+      6) live_logs;;
+      7) show_crontab; pause;;
+      8) show_time; pause;;
+      9) show_notify_state; pause;;
+      10) show_accounts_json; pause;;
+      11) edit_accounts_json; restart_bot_quiet; pause;;
+      12) edit_config; restart_bot_quiet; pause;;
+      13) backup_accounts; pause;;
+      0) return;;
+      *) echo "无效选项"; pause;;
+    esac
+  done
+}
+
 main_menu(){
   while true; do
     clear
@@ -97,6 +139,7 @@ main_menu(){
     echo "输入账号序号：进入该账号单独控制"
     echo "a. 增加账号"
     echo "d. 删除账号"
+    echo "t. TG Bot / 日志"
     echo "u. 完全卸载程序"
     echo "0. 退出"
     echo "=============================="
@@ -105,6 +148,7 @@ main_menu(){
       0) exit 0;;
       a|A) run_app --add-account; restart_bot_quiet; pause;;
       d|D) run_app --delete-account; restart_bot_quiet; pause;;
+      t|T) telegram_menu;;
       u|U) uninstall_all;;
       ''|*[!0-9]*) echo "无效选项"; pause;;
       *)
