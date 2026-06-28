@@ -10,7 +10,7 @@ SERVICE_NAME="traffic-control.service"
 echo "======================================"
 echo " 阿里云 CDT 流量控制一键安装（多账号版）"
 echo "======================================"
-echo "第一次安装只录入 1 个账号。以后新增账号用命令：cdt -> 多账号管理。"
+echo "第一次安装先录入 Telegram 全局配置，再录入 1 个阿里云账号。以后新增账号用命令：cdt -> a。Telegram 配置可在 cdt -> t 修改。"
 echo
 
 read -r -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
@@ -118,6 +118,6 @@ echo "第一个账号：${ACCOUNT_NAME}"
 echo "每日报告时间：${REPORT_TIME} UTC+8 / 北京时间"
 echo "月初自动恢复：每月1号 00:05 UTC+8 后检测，流量低于各账号阈值才开机"
 echo "控制菜单命令：cdt"
-echo "新增账号：cdt -> 多账号管理 -> 增加账号"
-echo "立即测试日报：cdt -> 8"
+echo "新增账号：cdt -> a"
+echo "Telegram 配置/测试：cdt -> t"
 echo "======================================"
