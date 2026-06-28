@@ -735,13 +735,21 @@ def list_accounts_cli():
         print('暂无账号。')
         return
     print('===== 账号列表 =====')
-    for i, acc in enumerate(accounts, start=1):
-        enabled = '启用' if account_enabled(acc) else '禁用'
-        intl = '国际版' if normalize_bool(acc.get('is_international')) else '国内版'
-        keep = '保活开' if account_keepalive_enabled(acc) else '保活关'
-        instance_status = get_vps_status(acc)
-        runtime = account_runtime_status(acc, instance_status)
-        print(f'{i}. {account_name(acc)} | {runtime} | {enabled} | {keep} | {intl} | {acc.get("region_id")} | {acc.get("instance_id")} | 阈值 {max_gb(acc):g}GB | 日报 {acc.get("daily_report_time")} UTC+8')
+
+    # cdt 首页只显示账号列表，不把阿里云 SDK 的完整错误日志喷到屏幕。
+    # 例如乱填 AccessKey 测试时，只显示“状态未知：Unknown”。
+    old_disable_level = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        for i, acc in enumerate(accounts, start=1):
+            enabled = '启用' if account_enabled(acc) else '禁用'
+            intl = '国际版' if normalize_bool(acc.get('is_international')) else '国内版'
+            keep = '保活开' if account_keepalive_enabled(acc) else '保活关'
+            instance_status = get_vps_status(acc)
+            runtime = account_runtime_status(acc, instance_status)
+            print(f'{i}. {account_name(acc)} | {runtime} | {enabled} | {keep} | {intl} | {acc.get("region_id")} | {acc.get("instance_id")} | 阈值 {max_gb(acc):g}GB | 日报 {acc.get("daily_report_time")} UTC+8')
+    finally:
+        logging.disable(old_disable_level)
 
 
 def add_account_cli():

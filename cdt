@@ -51,7 +51,7 @@ account_menu(){
     echo "=============================="
     echo " 账号 ${idx} 单独控制"
     echo "=============================="
-    run_app --list-accounts | sed -n "1p;$((idx+1))p" || true
+    run_app --list-accounts 2>/dev/null | sed -n "1p;$((idx+1))p" || true
     echo "=============================="
     echo "1. 查看这个账号状态"
     echo "2. 立即发送这个账号日报到频道"
@@ -136,7 +136,7 @@ main_menu(){
     echo " 阿里云 CDT 多账号控制"
     echo "=============================="
     echo "账号列表："
-    run_app --list-accounts || true
+    run_app --list-accounts 2>/dev/null || true
     echo "=============================="
     echo "输入账号序号：进入单账号控制"
     echo "a. 增加账号"
