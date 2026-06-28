@@ -1,3 +1,9 @@
+
+
+## 2026-06-28
+
+- 修复 cdt 首页账号列表报错：`account_keepalive_enabled` 未定义。
+- 首页账号运行状态改为纯中文文字，避免部分 SSH 终端 emoji 显示异常。
 # CHANGELOG
 
 ## 多账号版

@@ -326,6 +326,15 @@ def set_keepalive_enabled(enabled: bool):
         if os.path.exists(KEEPALIVE_FLAG_FILE):
             os.remove(KEEPALIVE_FLAG_FILE)
 
+
+def account_keepalive_enabled(account: Dict[str, Any]) -> bool:
+    """账号级自动保活开关。
+    兼容旧版本：如果账号里没有 auto_keepalive 字段，默认开启。
+    说明：现在 cdt 菜单按账号单独控制保活；全局 flag 仅保留给旧版本兼容，
+    不再影响单个账号的启停判断。
+    """
+    return normalize_bool(account.get('auto_keepalive', True))
+
 # =========================
 # ECS 控制
 # =========================
@@ -454,20 +463,20 @@ def account_runtime_status(account: Dict[str, Any], instance_status: Optional[st
     status_l = str(instance_status or 'Unknown').lower()
 
     if status_l == 'running':
-        return '🟢 机器在线运行中'
+        return '机器在线运行中'
     if status_l == 'starting':
-        return '🟡 正在开机中'
+        return '正在开机中'
     if status_l == 'stopping':
-        return '🟠 正在关机中'
+        return '正在关机中'
     if has_notify_key(account, 'traffic_stop'):
-        return '🔴 流量达到阈值已关机'
+        return '流量达到阈值已关机'
     if has_notify_key(account, 'manual_stop'):
-        return '⚫ 手动关机'
+        return '手动关机'
     if status_l == 'stopped':
         if not account_keepalive_enabled(account):
-            return '⚫ 已关机（保活关闭）'
-        return '⚪ 已关机（外部/未知原因）'
-    return f'❓ 状态未知：{instance_status}'
+            return '已关机（保活关闭）'
+        return '已关机（外部/未知原因）'
+    return f'状态未知：{instance_status}'
 
 
 def build_status_text(account: Dict[str, Any]) -> str:
