@@ -1,0 +1,960 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import json
+import re
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional, Tuple
+
+import requests
+from aliyunsdkcore.client import AcsClient
+from aliyunsdkcore.request import CommonRequest
+from aliyunsdkbssopenapi.request.v20171214 import QueryBillOverviewRequest
+from aliyunsdkbssopenapi.request.v20171214 import QueryAccountBalanceRequest
+from aliyunsdkecs.request.v20140526 import StartInstanceRequest
+from aliyunsdkecs.request.v20140526 import StopInstanceRequest
+from aliyunsdkecs.request.v20140526 import DescribeInstancesRequest
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.ext.dispatcher import run_async
+
+# =========================
+# 全局配置：安装脚本会替换这些值
+# =========================
+TELEGRAM_BOT_TOKEN = '__TELEGRAM_BOT_TOKEN__'
+TELEGRAM_CHAT_ID = '__TELEGRAM_CHAT_ID__'
+ADMIN_USER_ID = '__ADMIN_USER_ID__'
+
+BASE_DIR = '/root/aliyun-traffic-control'
+ACCOUNTS_FILE = os.path.join(BASE_DIR, 'accounts.json')
+KEEPALIVE_FLAG_FILE = os.path.join(BASE_DIR, 'keepalive_enabled.flag')
+LAST_NOTIFY_FILE = os.path.join(BASE_DIR, 'last_notify_state.json')
+
+MONTHLY_RESET_OPEN_HOUR = 0
+MONTHLY_RESET_OPEN_MINUTE = 5
+DEFAULT_DAILY_REPORT_TIME = '09:00'
+DEFAULT_MAX_TRAFFIC_GB = 180.0
+DEFAULT_BILL_REGION_ID = 'cn-hangzhou'
+
+# =========================
+# 日志
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# =========================
+# 时间：全部按北京时间 UTC+8
+# =========================
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def now_cn():
+    return datetime.now(CN_TZ)
+
+
+def now_text():
+    return now_cn().strftime('%Y-%m-%d %H:%M:%S UTC+8')
+
+
+def today_cn_str():
+    return now_cn().strftime('%Y-%m-%d')
+
+
+def get_billing_cycle():
+    return now_cn().strftime('%Y-%m')
+
+
+def get_report_hour_minute(account: Dict[str, Any]) -> Tuple[int, int]:
+    report_time = str(account.get('daily_report_time') or DEFAULT_DAILY_REPORT_TIME)
+    try:
+        hour_s, minute_s = report_time.strip().split(':', 1)
+        return int(hour_s), int(minute_s)
+    except Exception:
+        return 9, 0
+
+
+def is_daily_report_time(account: Dict[str, Any]) -> bool:
+    hour, minute = get_report_hour_minute(account)
+    now = now_cn()
+    return now.hour == hour and now.minute == minute
+
+
+def is_month_reset_open_window() -> bool:
+    now = now_cn()
+    return now.day == 1 and (
+        now.hour > MONTHLY_RESET_OPEN_HOUR or
+        (now.hour == MONTHLY_RESET_OPEN_HOUR and now.minute >= MONTHLY_RESET_OPEN_MINUTE)
+    )
+
+
+def get_next_cdt_reset_check_time() -> str:
+    now = now_cn()
+    if now.month == 12:
+        nxt = datetime(now.year + 1, 1, 1, MONTHLY_RESET_OPEN_HOUR, MONTHLY_RESET_OPEN_MINUTE, 0, tzinfo=CN_TZ)
+    else:
+        nxt = datetime(now.year, now.month + 1, 1, MONTHLY_RESET_OPEN_HOUR, MONTHLY_RESET_OPEN_MINUTE, 0, tzinfo=CN_TZ)
+    return nxt.strftime('%Y-%m-%d %H:%M:%S UTC+8')
+
+# =========================
+# 配置和账号
+# =========================
+
+def ensure_base_dir():
+    os.makedirs(BASE_DIR, exist_ok=True)
+
+
+def safe_float(value, default=DEFAULT_MAX_TRAFFIC_GB) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def normalize_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ['1', 'true', 'yes', 'y', '是']
+
+
+def account_key(account: Dict[str, Any]) -> str:
+    raw = str(account.get('name') or account.get('instance_id') or 'account')
+    key = re.sub(r'[^A-Za-z0-9_\-]+', '_', raw).strip('_')
+    return key or 'account'
+
+
+def account_name(account: Dict[str, Any]) -> str:
+    return str(account.get('name') or account.get('instance_id') or '未命名账号')
+
+
+def account_enabled(account: Dict[str, Any]) -> bool:
+    return normalize_bool(account.get('enabled', True))
+
+
+def load_accounts(include_disabled: bool = False) -> List[Dict[str, Any]]:
+    if not os.path.exists(ACCOUNTS_FILE):
+        return []
+    try:
+        with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict) and 'accounts' in data:
+            accounts = data.get('accounts') or []
+        elif isinstance(data, list):
+            accounts = data
+        else:
+            accounts = []
+        normalized = []
+        for acc in accounts:
+            if not isinstance(acc, dict):
+                continue
+            acc.setdefault('enabled', True)
+            acc.setdefault('bill_region_id', DEFAULT_BILL_REGION_ID)
+            acc.setdefault('max_traffic_gb', DEFAULT_MAX_TRAFFIC_GB)
+            acc.setdefault('daily_report_time', DEFAULT_DAILY_REPORT_TIME)
+            acc.setdefault('is_international', False)
+            if include_disabled or account_enabled(acc):
+                normalized.append(acc)
+        return normalized
+    except Exception as e:
+        logging.error(f'读取账号配置失败: {str(e)}')
+        return []
+
+
+def save_accounts(accounts: List[Dict[str, Any]]):
+    ensure_base_dir()
+    with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(ACCOUNTS_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def find_account(selector: Optional[str], include_disabled: bool = False) -> Optional[Dict[str, Any]]:
+    accounts = load_accounts(include_disabled=include_disabled)
+    if not accounts:
+        return None
+    if not selector:
+        return accounts[0]
+    selector_s = str(selector).strip()
+    if selector_s.isdigit():
+        idx = int(selector_s) - 1
+        if 0 <= idx < len(accounts):
+            return accounts[idx]
+    for acc in accounts:
+        if account_name(acc) == selector_s or account_key(acc) == selector_s or str(acc.get('instance_id')) == selector_s:
+            return acc
+    return None
+
+
+def validate_account(acc: Dict[str, Any]) -> List[str]:
+    missing = []
+    for field in ['name', 'access_key_id', 'access_key_secret', 'region_id', 'instance_id']:
+        if not str(acc.get(field) or '').strip():
+            missing.append(field)
+    return missing
+
+# =========================
+# 阿里云客户端
+# =========================
+
+def ecs_client(account: Dict[str, Any]) -> AcsClient:
+    return AcsClient(account['access_key_id'], account['access_key_secret'], account.get('region_id') or 'cn-hongkong')
+
+
+def bill_client(account: Dict[str, Any]) -> AcsClient:
+    return AcsClient(account['access_key_id'], account['access_key_secret'], account.get('bill_region_id') or DEFAULT_BILL_REGION_ID)
+
+# =========================
+# TG 和通知状态
+# =========================
+
+def send_tg(chat_id, text, parse_mode=None):
+    try:
+        data = {'chat_id': chat_id, 'text': text}
+        if parse_mode:
+            data['parse_mode'] = parse_mode
+        res = requests.post(
+            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
+            data=data,
+            timeout=10
+        )
+        if not res.ok:
+            logging.error(f'TG发送失败: {res.text}')
+            return False
+        return True
+    except Exception as e:
+        logging.error(f'发送TG失败: {str(e)}')
+        return False
+
+
+def is_admin(update: Update):
+    user_id = update.effective_user.id if update.effective_user else None
+    return str(user_id) == str(ADMIN_USER_ID)
+
+
+def get_chat_id(update: Update):
+    return update.effective_chat.id if update.effective_chat else ADMIN_USER_ID
+
+
+def load_notify_state():
+    try:
+        if not os.path.exists(LAST_NOTIFY_FILE):
+            return {}
+        with open(LAST_NOTIFY_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_notify_state(state):
+    try:
+        ensure_base_dir()
+        with open(LAST_NOTIFY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f'保存通知状态失败: {str(e)}')
+
+
+def scoped_key(account: Dict[str, Any], suffix: str) -> str:
+    return f'{account_key(account)}::{suffix}'
+
+
+def notify_once(account: Dict[str, Any], suffix: str, text: str):
+    key = scoped_key(account, suffix)
+    state = load_notify_state()
+    if state.get(key):
+        return False
+    if send_tg(TELEGRAM_CHAT_ID, text):
+        state[key] = now_text()
+        save_notify_state(state)
+        return True
+    return False
+
+
+def clear_notify_key(account: Dict[str, Any], suffix: str):
+    key = scoped_key(account, suffix)
+    state = load_notify_state()
+    if key in state:
+        del state[key]
+        save_notify_state(state)
+
+
+def has_notify_key(account: Dict[str, Any], suffix: str) -> bool:
+    return bool(load_notify_state().get(scoped_key(account, suffix)))
+
+
+def clear_account_notify_state(account: Dict[str, Any]):
+    prefix = f'{account_key(account)}::'
+    state = load_notify_state()
+    new_state = {k: v for k, v in state.items() if not k.startswith(prefix)}
+    if len(new_state) != len(state):
+        save_notify_state(new_state)
+
+
+def set_pending_keepalive(account: Dict[str, Any], status: str):
+    state = load_notify_state()
+    state[scoped_key(account, 'keepalive_pending')] = {'time': now_text(), 'status': status}
+    save_notify_state(state)
+
+
+def get_pending_keepalive(account: Dict[str, Any]):
+    return load_notify_state().get(scoped_key(account, 'keepalive_pending'))
+
+
+def clear_pending_keepalive(account: Dict[str, Any]):
+    clear_notify_key(account, 'keepalive_pending')
+
+# =========================
+# 全局保活开关
+# =========================
+
+def keepalive_enabled():
+    return os.path.exists(KEEPALIVE_FLAG_FILE)
+
+
+def set_keepalive_enabled(enabled: bool):
+    ensure_base_dir()
+    if enabled:
+        with open(KEEPALIVE_FLAG_FILE, 'w', encoding='utf-8') as f:
+            f.write('enabled\n')
+    else:
+        if os.path.exists(KEEPALIVE_FLAG_FILE):
+            os.remove(KEEPALIVE_FLAG_FILE)
+
+# =========================
+# ECS 控制
+# =========================
+
+def get_vps_status(account: Dict[str, Any]) -> str:
+    instance_id = account.get('instance_id')
+    if not instance_id:
+        return 'Unknown'
+    try:
+        request = DescribeInstancesRequest.DescribeInstancesRequest()
+        request.set_InstanceIds([instance_id])
+        response = ecs_client(account).do_action_with_exception(request)
+        data = json.loads(response.decode('utf-8'))
+        instances = data.get('Instances', {}).get('Instance', [])
+        if not instances:
+            return 'Unknown'
+        return instances[0].get('Status', 'Unknown')
+    except Exception as e:
+        logging.error(f'[{account_name(account)}] 查询实例状态失败: {str(e)}')
+        return 'Unknown'
+
+
+def start_vps_safety(account: Dict[str, Any]) -> Tuple[bool, str]:
+    instance_id = account.get('instance_id')
+    if not instance_id:
+        return False, '❌ INSTANCE_ID 未配置'
+    try:
+        status = get_vps_status(account)
+        status_l = status.lower()
+        if status_l == 'running':
+            return True, '✅ 实例已经是 Running，无需开机'
+        if status_l in ['starting', 'stopping']:
+            return True, f'⏳ 实例当前是 {status}，正在变化中，等待恢复 Running'
+        request = StartInstanceRequest.StartInstanceRequest()
+        request.set_InstanceId(instance_id)
+        ecs_client(account).do_action_with_exception(request)
+        return True, '✅ StartInstance() 调用成功，实例正在启动'
+    except Exception as e:
+        logging.error(f'[{account_name(account)}] 开机失败: {str(e)}')
+        return False, f'❌ 开机失败：{str(e)}'
+
+
+def stop_vps_safety(account: Dict[str, Any]) -> Tuple[bool, str]:
+    instance_id = account.get('instance_id')
+    if not instance_id:
+        return False, '❌ INSTANCE_ID 未配置'
+    try:
+        status = get_vps_status(account)
+        status_l = status.lower()
+        if status_l == 'stopped':
+            return True, '✅ 实例已经是 Stopped，无需关机'
+        if status_l == 'stopping':
+            return True, f'⏳ 实例当前是 {status}，正在关机中'
+        request = StopInstanceRequest.StopInstanceRequest()
+        request.set_InstanceId(instance_id)
+        request.set_ForceStop(True)
+        ecs_client(account).do_action_with_exception(request)
+        return True, '✅ StopInstance() 调用成功，实例正在关机'
+    except Exception as e:
+        logging.error(f'[{account_name(account)}] 关机失败: {str(e)}')
+        return False, f'❌ 关机失败：{str(e)}'
+
+# =========================
+# CDT 和账单
+# =========================
+
+def get_cdt_traffic(account: Dict[str, Any]) -> float:
+    request = CommonRequest()
+    request.set_domain('cdt.aliyuncs.com')
+    request.set_version('2021-08-13')
+    request.set_action_name('ListCdtInternetTraffic')
+    request.set_method('POST')
+    try:
+        response = ecs_client(account).do_action_with_exception(request)
+        response_json = json.loads(response.decode('utf-8'))
+        total_bytes = sum(d.get('Traffic', 0) for d in response_json.get('TrafficDetails', []))
+        return round(total_bytes / (1024 ** 3), 2)
+    except Exception as e:
+        logging.error(f'[{account_name(account)}] CDT流量查询失败: {str(e)}')
+        return 0.0
+
+
+def get_aliyun_data(account: Dict[str, Any]) -> str:
+    try:
+        balance = '0.00'
+        request_bal = QueryAccountBalanceRequest.QueryAccountBalanceRequest()
+        request_bal.set_accept_format('json')
+        res_bal = bill_client(account).do_action_with_exception(request_bal)
+        data_bal = json.loads(res_bal.decode('utf-8'))
+        if data_bal.get('Success'):
+            balance = data_bal.get('Data', {}).get('AvailableAmount', '0.00')
+
+        request_bill = QueryBillOverviewRequest.QueryBillOverviewRequest()
+        request_bill.set_accept_format('json')
+        request_bill.set_BillingCycle(get_billing_cycle())
+        res_bill = bill_client(account).do_action_with_exception(request_bill)
+        data_bill = json.loads(res_bill.decode('utf-8'))
+        cost = 0.0
+        if data_bill.get('Success') and data_bill.get('Data'):
+            items = data_bill.get('Data', {}).get('Items', {}).get('Item', [])
+            cost = sum(float(item.get('PretaxAmount', 0)) for item in items)
+
+        if normalize_bool(account.get('is_international')):
+            return f'💳 扣费方式：国际站后付费\n💵 本月消费（1号至今）：${cost:.2f}'
+        return f'💰 账户现金余额：{balance} 元\n💵 本月消费（1号至今）：{cost:.2f} 元'
+    except Exception as e:
+        logging.error(f'[{account_name(account)}] 查询余额/账单失败: {str(e)}')
+        if normalize_bool(account.get('is_international')):
+            return '💳 扣费方式：国际站后付费\n💵 本月消费（1号至今）：$0.00'
+        return '💰 账户现金余额：暂无数据\n💵 本月消费（1号至今）：0.00 元'
+
+# =========================
+# 消息
+# =========================
+
+def max_gb(account: Dict[str, Any]) -> float:
+    return safe_float(account.get('max_traffic_gb'), DEFAULT_MAX_TRAFFIC_GB)
+
+
+def build_status_text(account: Dict[str, Any]) -> str:
+    traffic = get_cdt_traffic(account)
+    instance_status = get_vps_status(account)
+    financial_info = get_aliyun_data(account)
+    keep_status = '正常' if keepalive_enabled() else '已暂停'
+    enabled_text = '启用' if account_enabled(account) else '已禁用'
+    return (
+        f'📊 阿里云账号 {account_name(account)} - CDT服务器\n\n'
+        '----------------------------------\n'
+        f'⏰ 时间：{now_text()}\n'
+        f'📡 当前流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'🖥 实例状态：{instance_status}\n'
+        f'🌍 ECS区域：{account.get("region_id")}\n'
+        f'🆔 实例：{account.get("instance_id")}\n'
+        f'{financial_info}\n'
+        f'⚡ 保活运行状态：{keep_status}\n'
+        f'🔘 账号状态：{enabled_text}\n'
+        f'📅 下次自动检测开机：{get_next_cdt_reset_check_time()}\n'
+        '✅ 流量控制脚本运行正常\n'
+        '----------------------------------'
+    )
+
+
+def build_all_status_text() -> str:
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        return '❌ 暂无账号，请先用 cdt -> 多账号管理 -> 增加账号。'
+    parts = [build_status_text(acc) for acc in accounts]
+    return '\n\n'.join(parts)
+
+
+def build_help_text() -> str:
+    return (
+        '🤖 阿里云 CDT 多账号控制机器人命令\n\n'
+        '/status - 查看所有账号完整状态\n'
+        '/traffic - 查看所有账号 CDT 流量\n'
+        '/bill - 查看所有账号余额/本月消费\n'
+        '/report - 立即发送所有账号报告到频道\n'
+        '/startvps 账号名或序号 - 给指定账号开机，不填则默认第1个\n'
+        '/stopvps 账号名或序号 - 给指定账号关机，不填则默认第1个\n'
+        '/keepon - 开启全局自动保活\n'
+        '/keepoff - 暂停全局自动保活\n'
+        '/help - 查看命令帮助\n\n'
+        '说明：\n'
+        '1. 机器人只接受管理员私聊命令。\n'
+        '2. 每个账号可设置自己的日报时间，固定按北京时间 UTC+8。\n'
+        '3. 每个账号独立流量阈值、熔断通知、月初自动开机通知。\n'
+        '4. 因流量熔断关机后，每月1号00:05 UTC+8以后，若该账号 CDT 流量低于阈值才自动开机。'
+    )
+
+
+def build_keepalive_success_notice(account, old_status, traffic):
+    return (
+        f'〖保活恢复成功〗\n\n账号：{account_name(account)}\n'
+        f'之前状态：{old_status}\n当前状态：Running\n\n'
+        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'实例：{account.get("instance_id")}\n时间：{now_text()}'
+    )
+
+
+def build_keepalive_action_notice(account, old_status, result_msg, traffic):
+    return (
+        f'〖保活已触发〗\n\n账号：{account_name(account)}\n'
+        f'检测到实例状态：{old_status}\n'
+        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'动作结果：{result_msg}\n\n'
+        '系统已开始救活，等待实例恢复 Running 后会再次通知。\n'
+        f'实例：{account.get("instance_id")}\n时间：{now_text()}'
+    )
+
+
+def build_monthly_reset_start_notice(account, traffic, result_msg):
+    return (
+        f'〖月初流量恢复自动开机〗\n\n账号：{account_name(account)}\n'
+        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'自动开机条件：每月1号00:05以后 且 CDT流量 < {max_gb(account):g} GB\n'
+        f'动作结果：{result_msg}\n\n'
+        '系统判断免费额度已进入新账期或流量低于保护阈值，已执行自动开机。\n'
+        f'实例：{account.get("instance_id")}\n时间：{now_text()}'
+    )
+
+
+def build_traffic_stop_notice(account, traffic, result_msg):
+    return (
+        f'〖流量熔断关机通知〗\n\n账号：{account_name(account)}\n'
+        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'动作结果：{result_msg}\n\n'
+        '系统已执行关机保护，避免继续产生流量费用。\n'
+        f'下次自动检测开机：{get_next_cdt_reset_check_time()}\n'
+        f'自动开机条件：到达检测时间后 CDT流量 < {max_gb(account):g} GB\n'
+        f'实例：{account.get("instance_id")}\n时间：{now_text()}'
+    )
+
+# =========================
+# cron 单账号逻辑
+# =========================
+
+def maybe_send_daily_report(account):
+    if is_daily_report_time(account):
+        suffix = f'daily_report_{today_cn_str()}'
+        if notify_once(account, suffix, build_status_text(account)):
+            logging.info(f'[{account_name(account)}] 已发送每日 {account.get("daily_report_time")} 北京时间报告到频道。')
+    else:
+        state = load_notify_state()
+        prefix = f'{account_key(account)}::daily_report_'
+        today_key = scoped_key(account, f'daily_report_{today_cn_str()}')
+        old_keys = [k for k in state if k.startswith(prefix) and k != today_key]
+        if old_keys:
+            for key in old_keys:
+                del state[key]
+            save_notify_state(state)
+
+
+def check_one_account(account: Dict[str, Any]):
+    missing = validate_account(account)
+    if missing:
+        logging.error(f'[{account_name(account)}] 账号配置缺少字段: {", ".join(missing)}')
+        return
+
+    maybe_send_daily_report(account)
+
+    traffic = get_cdt_traffic(account)
+    status_before = get_vps_status(account)
+    status_l = status_before.lower()
+    logging.info(f'[{account_name(account)}] cron检查：流量 {traffic} GB / {max_gb(account):g} GB，实例状态 {status_before}')
+
+    if now_cn().day != 1:
+        clear_notify_key(account, 'monthly_reset_start')
+
+    if traffic >= max_gb(account):
+        ok, result = stop_vps_safety(account)
+        logging.warning(f'[{account_name(account)}] {result}')
+        notify_once(account, 'traffic_stop', build_traffic_stop_notice(account, traffic, result))
+        return
+
+    if not keepalive_enabled():
+        logging.info(f'[{account_name(account)}] 保活已暂停，跳过自动开机。')
+        clear_notify_key(account, 'keepalive_failed')
+        return
+
+    traffic_stopped = has_notify_key(account, 'traffic_stop')
+    if traffic_stopped:
+        if not is_month_reset_open_window():
+            logging.info(f'[{account_name(account)}] 此前因流量熔断关机，未到每月1号00:05 UTC+8，暂不自动开机。')
+            return
+        ok, result = start_vps_safety(account)
+        logging.info(f'[{account_name(account)}] {result}')
+        if ok:
+            notify_once(account, 'monthly_reset_start', build_monthly_reset_start_notice(account, traffic, result))
+            clear_notify_key(account, 'traffic_stop')
+            set_pending_keepalive(account, status_before)
+        else:
+            notify_once(account, 'keepalive_failed', (
+                f'〖月初自动开机失败〗\n\n账号：{account_name(account)}\n'
+                f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+                f'失败原因：{result}\n\n请检查余额、实例状态、阿里云风控或实例是否已释放。\n'
+                f'实例：{account.get("instance_id")}\n时间：{now_text()}'
+            ))
+        return
+
+    if status_l == 'running':
+        pending = get_pending_keepalive(account)
+        if pending:
+            old_status = pending.get('status', 'Unknown')
+            send_tg(TELEGRAM_CHAT_ID, build_keepalive_success_notice(account, old_status, traffic))
+            clear_pending_keepalive(account)
+            clear_notify_key(account, 'keepalive_action')
+            clear_notify_key(account, 'keepalive_failed')
+        logging.info(f'[{account_name(account)}] 实例 Running，保活正常。')
+        return
+
+    if status_l in ['starting', 'stopping']:
+        set_pending_keepalive(account, status_before)
+        logging.info(f'[{account_name(account)}] 实例状态 {status_before}，等待状态稳定。')
+        return
+
+    ok, result = start_vps_safety(account)
+    logging.info(f'[{account_name(account)}] {result}')
+    set_pending_keepalive(account, status_before)
+    if ok:
+        notify_once(account, 'keepalive_action', build_keepalive_action_notice(account, status_before, result, traffic))
+    else:
+        notify_once(account, 'keepalive_failed', (
+            f'〖保活启动失败〗\n\n账号：{account_name(account)}\n'
+            f'检测到实例状态：{status_before}\n'
+            f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+            f'失败原因：{result}\n\n请检查余额、实例状态、阿里云风控或实例是否已释放。\n'
+            f'实例：{account.get("instance_id")}\n时间：{now_text()}'
+        ))
+
+
+def check_cron_job():
+    accounts = load_accounts(include_disabled=False)
+    if not accounts:
+        logging.warning('没有启用的账号，跳过 cron。')
+        return
+    for account in accounts:
+        try:
+            check_one_account(account)
+        except Exception as e:
+            logging.error(f'[{account_name(account)}] cron处理失败: {str(e)}')
+
+# =========================
+# CLI 多账号管理
+# =========================
+
+def prompt(msg: str, default: Optional[str] = None, secret: bool = False) -> str:
+    # secret 保留参数，避免额外依赖 getpass；root 终端录入简单直接。
+    if default is None:
+        val = input(msg).strip()
+    else:
+        val = input(f'{msg}，默认 {default}: ').strip()
+        if not val:
+            val = default
+    return val
+
+
+def prompt_bool(msg: str, default: bool = False) -> bool:
+    suffix = '默认 y' if default else '默认 n'
+    val = input(f'{msg}，输入 y/n，{suffix}: ').strip().lower()
+    if not val:
+        return default
+    return val in ['y', 'yes', '1', 'true', '是']
+
+
+def build_account_from_prompt(existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    existing = existing or {}
+    acc = dict(existing)
+    acc['name'] = prompt('账号显示名称，例如 zymsdf-香港', existing.get('name', 'zymsdf'))
+    acc['access_key_id'] = prompt('阿里云 ACCESS_KEY_ID', existing.get('access_key_id'))
+    acc['access_key_secret'] = prompt('阿里云 ACCESS_KEY_SECRET', existing.get('access_key_secret'))
+    acc['region_id'] = prompt('ECS 区域，例如 cn-hongkong', existing.get('region_id', 'cn-hongkong'))
+    acc['instance_id'] = prompt('ECS 实例 ID', existing.get('instance_id'))
+    acc['bill_region_id'] = prompt('账单接口区域', existing.get('bill_region_id', DEFAULT_BILL_REGION_ID))
+    acc['max_traffic_gb'] = safe_float(prompt('流量阈值 GB', str(existing.get('max_traffic_gb', DEFAULT_MAX_TRAFFIC_GB))))
+    acc['is_international'] = prompt_bool('是否国际版账号', normalize_bool(existing.get('is_international', False)))
+    report_default = existing.get('daily_report_time', DEFAULT_DAILY_REPORT_TIME)
+    report_time = prompt('每天日报推送时间 HH:MM，固定按北京时间 UTC+8', report_default)
+    if not re.match(r'^([01][0-9]|2[0-3]):[0-5][0-9]$', report_time):
+        print('日报时间格式错误，已使用 09:00')
+        report_time = DEFAULT_DAILY_REPORT_TIME
+    acc['daily_report_time'] = report_time
+    acc['enabled'] = prompt_bool('是否启用这个账号', normalize_bool(existing.get('enabled', True)))
+    return acc
+
+
+def list_accounts_cli():
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        print('暂无账号。')
+        return
+    print('===== 账号列表 =====')
+    for i, acc in enumerate(accounts, start=1):
+        enabled = '启用' if account_enabled(acc) else '禁用'
+        intl = '国际版' if normalize_bool(acc.get('is_international')) else '国内版'
+        print(f'{i}. {account_name(acc)} | {enabled} | {intl} | {acc.get("region_id")} | {acc.get("instance_id")} | 阈值 {max_gb(acc):g}GB | 日报 {acc.get("daily_report_time")} UTC+8')
+
+
+def add_account_cli():
+    accounts = load_accounts(include_disabled=True)
+    print('请按提示录入新账号。不同阿里云账号要填各自的 AccessKey。')
+    acc = build_account_from_prompt()
+    missing = validate_account(acc)
+    if missing:
+        print('配置缺少字段：' + ', '.join(missing))
+        return
+    accounts.append(acc)
+    save_accounts(accounts)
+    print(f'✅ 已增加账号：{account_name(acc)}')
+
+
+def delete_account_cli():
+    accounts = load_accounts(include_disabled=True)
+    list_accounts_cli()
+    if not accounts:
+        return
+    val = input('请输入要删除的账号序号或名称: ').strip()
+    acc = find_account(val, include_disabled=True)
+    if not acc:
+        print('没有找到这个账号。')
+        return
+    confirm = input(f'确定删除账号 {account_name(acc)}？输入 yes 继续: ').strip()
+    if confirm != 'yes':
+        print('已取消。')
+        return
+    accounts = [a for a in accounts if account_key(a) != account_key(acc)]
+    save_accounts(accounts)
+    clear_account_notify_state(acc)
+    print(f'✅ 已删除账号：{account_name(acc)}')
+
+
+def edit_account_cli():
+    accounts = load_accounts(include_disabled=True)
+    list_accounts_cli()
+    if not accounts:
+        return
+    val = input('请输入要编辑的账号序号或名称: ').strip()
+    target = find_account(val, include_disabled=True)
+    if not target:
+        print('没有找到这个账号。')
+        return
+    old_key = account_key(target)
+    new_acc = build_account_from_prompt(target)
+    new_accounts = []
+    for acc in accounts:
+        if account_key(acc) == old_key:
+            new_accounts.append(new_acc)
+        else:
+            new_accounts.append(acc)
+    save_accounts(new_accounts)
+    print(f'✅ 已更新账号：{account_name(new_acc)}')
+
+
+def set_account_enabled_cli(enabled: bool):
+    accounts = load_accounts(include_disabled=True)
+    list_accounts_cli()
+    if not accounts:
+        return
+    val = input('请输入账号序号或名称: ').strip()
+    target = find_account(val, include_disabled=True)
+    if not target:
+        print('没有找到这个账号。')
+        return
+    target_key = account_key(target)
+    for acc in accounts:
+        if account_key(acc) == target_key:
+            acc['enabled'] = enabled
+            break
+    save_accounts(accounts)
+    print(f'✅ 已{"启用" if enabled else "禁用"}账号：{account_name(target)}')
+
+# =========================
+# Bot 命令
+# =========================
+
+def selector_from_args(context: CallbackContext) -> Optional[str]:
+    if context and context.args:
+        return ' '.join(context.args).strip()
+    return None
+
+
+@run_async
+def help_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    context.bot.send_message(chat_id=get_chat_id(update), text=build_help_text())
+
+
+@run_async
+def status_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    context.bot.send_message(chat_id=get_chat_id(update), text=build_all_status_text())
+
+
+@run_async
+def traffic_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        context.bot.send_message(chat_id=get_chat_id(update), text='暂无账号。')
+        return
+    lines = ['📡 CDT 流量汇总']
+    for i, acc in enumerate(accounts, start=1):
+        traffic = get_cdt_traffic(acc)
+        enabled = '启用' if account_enabled(acc) else '禁用'
+        lines.append(f'{i}. {account_name(acc)}：{traffic} GB / {max_gb(acc):g} GB（{enabled}）')
+    context.bot.send_message(chat_id=get_chat_id(update), text='\n'.join(lines))
+
+
+@run_async
+def bill_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        context.bot.send_message(chat_id=get_chat_id(update), text='暂无账号。')
+        return
+    parts = [f'账号：{account_name(acc)}\n{get_aliyun_data(acc)}' for acc in accounts]
+    context.bot.send_message(chat_id=get_chat_id(update), text='\n\n'.join(parts))
+
+
+@run_async
+def startvps_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    acc = find_account(selector_from_args(context), include_disabled=True)
+    if not acc:
+        context.bot.send_message(chat_id=get_chat_id(update), text='没有找到账号。可用 /status 查看账号。')
+        return
+    ok, result = start_vps_safety(acc)
+    if ok:
+        clear_notify_key(acc, 'traffic_stop')
+    context.bot.send_message(chat_id=get_chat_id(update), text=f'账号：{account_name(acc)}\n{result}')
+
+
+@run_async
+def stopvps_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    acc = find_account(selector_from_args(context), include_disabled=True)
+    if not acc:
+        context.bot.send_message(chat_id=get_chat_id(update), text='没有找到账号。可用 /status 查看账号。')
+        return
+    ok, result = stop_vps_safety(acc)
+    context.bot.send_message(chat_id=get_chat_id(update), text=f'账号：{account_name(acc)}\n{result}')
+
+
+@run_async
+def keepon_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    set_keepalive_enabled(True)
+    for acc in load_accounts(include_disabled=True):
+        clear_notify_key(acc, 'keepalive_action')
+        clear_notify_key(acc, 'keepalive_failed')
+        clear_pending_keepalive(acc)
+    context.bot.send_message(chat_id=get_chat_id(update), text='✅ 全局自动保活已开启。')
+
+
+@run_async
+def keepoff_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    set_keepalive_enabled(False)
+    for acc in load_accounts(include_disabled=True):
+        clear_notify_key(acc, 'keepalive_action')
+        clear_notify_key(acc, 'keepalive_failed')
+        clear_pending_keepalive(acc)
+    context.bot.send_message(chat_id=get_chat_id(update), text='⏸ 全局自动保活已暂停。超流量仍会关机。')
+
+
+@run_async
+def report_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    send_tg(TELEGRAM_CHAT_ID, build_all_status_text())
+    context.bot.send_message(chat_id=get_chat_id(update), text='✅ 已发送所有账号完整报告到频道。')
+
+
+def send_report_now():
+    send_tg(TELEGRAM_CHAT_ID, build_all_status_text())
+    logging.info('已手动发送所有账号日报到频道。')
+
+# =========================
+# 主入口
+# =========================
+
+def main():
+    ensure_base_dir()
+
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == '--cron':
+            check_cron_job()
+            return
+        if cmd == '--report':
+            send_report_now()
+            return
+        if cmd == '--list-accounts':
+            list_accounts_cli()
+            return
+        if cmd == '--add-account':
+            add_account_cli()
+            return
+        if cmd == '--delete-account':
+            delete_account_cli()
+            return
+        if cmd == '--edit-account':
+            edit_account_cli()
+            return
+        if cmd == '--enable-account':
+            set_account_enabled_cli(True)
+            return
+        if cmd == '--disable-account':
+            set_account_enabled_cli(False)
+            return
+        if cmd == '--status-all':
+            print(build_all_status_text())
+            return
+
+    if not os.path.exists(KEEPALIVE_FLAG_FILE):
+        set_keepalive_enabled(True)
+
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        logging.warning('暂无账号。请运行 cdt -> 多账号管理 -> 增加账号。')
+
+    updater = Updater(
+        TELEGRAM_BOT_TOKEN,
+        workers=4,
+        request_kwargs={'read_timeout': 10, 'connect_timeout': 10}
+    )
+
+    dispatcher = updater.dispatcher
+    dispatcher.add_handler(CommandHandler('help', help_command))
+    dispatcher.add_handler(CommandHandler('status', status_command))
+    dispatcher.add_handler(CommandHandler('traffic', traffic_command))
+    dispatcher.add_handler(CommandHandler('bill', bill_command))
+    dispatcher.add_handler(CommandHandler('startvps', startvps_command))
+    dispatcher.add_handler(CommandHandler('stopvps', stopvps_command))
+    dispatcher.add_handler(CommandHandler('keepon', keepon_command))
+    dispatcher.add_handler(CommandHandler('keepoff', keepoff_command))
+    dispatcher.add_handler(CommandHandler('report', report_command))
+
+    updater.start_polling(clean=True)
+    logging.info('Telegram Bot 已启动：多账号模式，日报由 cron 按北京时间判断发送。')
+    updater.idle()
+
+
+if __name__ == '__main__':
+    main()
