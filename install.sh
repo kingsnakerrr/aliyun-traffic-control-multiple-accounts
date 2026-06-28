@@ -95,8 +95,14 @@ accounts = [{
     'daily_report_time': os.environ['REPORT_TIME'],
     'enabled': True,
 }]
-(base / 'accounts.json').write_text(json.dumps(accounts, ensure_ascii=False, indent=2), encoding='utf-8')
-os.chmod(base / 'accounts.json', 0o600)
+accounts_path = base / 'accounts.json'
+if accounts_path.exists():
+    # 覆盖安装时不要直接丢失旧 accounts.json；备份后再写入第一个安装账号。
+    import datetime
+    bak = base / ('accounts.json.bak.' + datetime.datetime.now().strftime('%Y%m%d%H%M%S'))
+    bak.write_text(accounts_path.read_text(encoding='utf-8'), encoding='utf-8')
+accounts_path.write_text(json.dumps(accounts, ensure_ascii=False, indent=2), encoding='utf-8')
+os.chmod(accounts_path, 0o600)
 PYACCOUNTS
 
 chmod +x "${BASE_DIR}/traffic_control.py"
