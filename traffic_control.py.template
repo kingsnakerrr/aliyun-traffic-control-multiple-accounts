@@ -445,11 +445,37 @@ def max_gb(account: Dict[str, Any]) -> float:
     return safe_float(account.get('max_traffic_gb'), DEFAULT_MAX_TRAFFIC_GB)
 
 
+def account_runtime_status(account: Dict[str, Any], instance_status: Optional[str] = None) -> str:
+    """给 cdt 首页和通知用的人话状态。
+    traffic_stop/manual_stop 只记录本程序触发的原因；如果用户在阿里云后台关机，显示为未知原因关机。
+    """
+    if instance_status is None:
+        instance_status = get_vps_status(account)
+    status_l = str(instance_status or 'Unknown').lower()
+
+    if status_l == 'running':
+        return '🟢 机器在线运行中'
+    if status_l == 'starting':
+        return '🟡 正在开机中'
+    if status_l == 'stopping':
+        return '🟠 正在关机中'
+    if has_notify_key(account, 'traffic_stop'):
+        return '🔴 流量达到阈值已关机'
+    if has_notify_key(account, 'manual_stop'):
+        return '⚫ 手动关机'
+    if status_l == 'stopped':
+        if not account_keepalive_enabled(account):
+            return '⚫ 已关机（保活关闭）'
+        return '⚪ 已关机（外部/未知原因）'
+    return f'❓ 状态未知：{instance_status}'
+
+
 def build_status_text(account: Dict[str, Any]) -> str:
     traffic = get_cdt_traffic(account)
     instance_status = get_vps_status(account)
+    runtime_status = account_runtime_status(account, instance_status)
     financial_info = get_aliyun_data(account)
-    keep_status = '正常' if keepalive_enabled() else '已暂停'
+    keep_status = '正常' if account_keepalive_enabled(account) else '已暂停'
     enabled_text = '启用' if account_enabled(account) else '已禁用'
     return (
         f'📊 阿里云账号 {account_name(account)} - CDT服务器\n\n'
@@ -457,6 +483,7 @@ def build_status_text(account: Dict[str, Any]) -> str:
         f'⏰ 时间：{now_text()}\n'
         f'📡 当前流量：{traffic} GB / {max_gb(account):g} GB\n'
         f'🖥 实例状态：{instance_status}\n'
+        f'📌 当前状态：{runtime_status}\n'
         f'🌍 ECS区域：{account.get("region_id")}\n'
         f'🆔 实例：{account.get("instance_id")}\n'
         f'{financial_info}\n'
@@ -575,13 +602,14 @@ def check_one_account(account: Dict[str, Any]):
         clear_notify_key(account, 'monthly_reset_start')
 
     if traffic >= max_gb(account):
+        clear_notify_key(account, 'manual_stop')
         ok, result = stop_vps_safety(account)
         logging.warning(f'[{account_name(account)}] {result}')
         notify_once(account, 'traffic_stop', build_traffic_stop_notice(account, traffic, result))
         return
 
-    if not keepalive_enabled():
-        logging.info(f'[{account_name(account)}] 保活已暂停，跳过自动开机。')
+    if not account_keepalive_enabled(account):
+        logging.info(f'[{account_name(account)}] 这个账号的自动保活已关闭，跳过自动开机。')
         clear_notify_key(account, 'keepalive_failed')
         return
 
@@ -687,6 +715,7 @@ def build_account_from_prompt(existing: Optional[Dict[str, Any]] = None) -> Dict
         print('日报时间格式错误，已使用 09:00')
         report_time = DEFAULT_DAILY_REPORT_TIME
     acc['daily_report_time'] = report_time
+    acc['auto_keepalive'] = prompt_bool('是否开启这个账号自动保活', account_keepalive_enabled(acc))
     acc['enabled'] = prompt_bool('是否启用这个账号', normalize_bool(existing.get('enabled', True)))
     return acc
 
@@ -700,7 +729,10 @@ def list_accounts_cli():
     for i, acc in enumerate(accounts, start=1):
         enabled = '启用' if account_enabled(acc) else '禁用'
         intl = '国际版' if normalize_bool(acc.get('is_international')) else '国内版'
-        print(f'{i}. {account_name(acc)} | {enabled} | {intl} | {acc.get("region_id")} | {acc.get("instance_id")} | 阈值 {max_gb(acc):g}GB | 日报 {acc.get("daily_report_time")} UTC+8')
+        keep = '保活开' if account_keepalive_enabled(acc) else '保活关'
+        instance_status = get_vps_status(acc)
+        runtime = account_runtime_status(acc, instance_status)
+        print(f'{i}. {account_name(acc)} | {runtime} | {enabled} | {keep} | {intl} | {acc.get("region_id")} | {acc.get("instance_id")} | 阈值 {max_gb(acc):g}GB | 日报 {acc.get("daily_report_time")} UTC+8')
 
 
 def add_account_cli():
@@ -797,6 +829,30 @@ def set_account_enabled_cli(enabled: bool):
     print(f'✅ 已{"启用" if enabled else "禁用"}账号：{account_name(target)}')
 
 
+def set_account_keepalive_cli(enabled: bool):
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        print('暂无账号。')
+        return
+    val = account_selector_from_argv('请输入账号序号或名称: ')
+    if not val:
+        return
+    target = find_account(val, include_disabled=True)
+    if not target:
+        print('没有找到这个账号。')
+        return
+    target_key = account_key(target)
+    for acc in accounts:
+        if account_key(acc) == target_key:
+            acc['auto_keepalive'] = enabled
+            break
+    save_accounts(accounts)
+    clear_notify_key(target, 'keepalive_action')
+    clear_notify_key(target, 'keepalive_failed')
+    clear_pending_keepalive(target)
+    print(f'✅ 已{"开启" if enabled else "关闭"}账号自动保活：{account_name(target)}')
+
+
 def get_selected_account_cli(include_disabled=True):
     val = account_selector_from_argv()
     if not val:
@@ -825,6 +881,9 @@ def start_account_cli():
     acc = get_selected_account_cli(include_disabled=True)
     if acc:
         ok, result = start_vps_safety(acc)
+        if ok:
+            clear_notify_key(acc, 'manual_stop')
+            clear_notify_key(acc, 'traffic_stop')
         print(result)
 
 
@@ -832,6 +891,11 @@ def stop_account_cli():
     acc = get_selected_account_cli(include_disabled=True)
     if acc:
         ok, result = stop_vps_safety(acc)
+        if ok:
+            clear_notify_key(acc, 'traffic_stop')
+            state = load_notify_state()
+            state[scoped_key(acc, 'manual_stop')] = now_text()
+            save_notify_state(state)
         print(result)
 
 
@@ -904,6 +968,7 @@ def startvps_command(update: Update, context: CallbackContext):
     ok, result = start_vps_safety(acc)
     if ok:
         clear_notify_key(acc, 'traffic_stop')
+        clear_notify_key(acc, 'manual_stop')
     context.bot.send_message(chat_id=get_chat_id(update), text=f'账号：{account_name(acc)}\n{result}')
 
 
@@ -916,6 +981,11 @@ def stopvps_command(update: Update, context: CallbackContext):
         context.bot.send_message(chat_id=get_chat_id(update), text='没有找到账号。可用 /status 查看账号。')
         return
     ok, result = stop_vps_safety(acc)
+    if ok:
+        clear_notify_key(acc, 'traffic_stop')
+        state = load_notify_state()
+        state[scoped_key(acc, 'manual_stop')] = now_text()
+        save_notify_state(state)
     context.bot.send_message(chat_id=get_chat_id(update), text=f'账号：{account_name(acc)}\n{result}')
 
 
@@ -923,24 +993,40 @@ def stopvps_command(update: Update, context: CallbackContext):
 def keepon_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-    set_keepalive_enabled(True)
-    for acc in load_accounts(include_disabled=True):
-        clear_notify_key(acc, 'keepalive_action')
-        clear_notify_key(acc, 'keepalive_failed')
-        clear_pending_keepalive(acc)
-    context.bot.send_message(chat_id=get_chat_id(update), text='✅ 全局自动保活已开启。')
+    acc = find_account(selector_from_args(context), include_disabled=True)
+    if not acc:
+        context.bot.send_message(chat_id=get_chat_id(update), text='没有找到账号。用法：/keepon 账号名或序号')
+        return
+    accounts = load_accounts(include_disabled=True)
+    for item in accounts:
+        if account_key(item) == account_key(acc):
+            item['auto_keepalive'] = True
+            break
+    save_accounts(accounts)
+    clear_notify_key(acc, 'keepalive_action')
+    clear_notify_key(acc, 'keepalive_failed')
+    clear_pending_keepalive(acc)
+    context.bot.send_message(chat_id=get_chat_id(update), text=f'✅ 已开启账号自动保活：{account_name(acc)}')
 
 
 @run_async
 def keepoff_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-    set_keepalive_enabled(False)
-    for acc in load_accounts(include_disabled=True):
-        clear_notify_key(acc, 'keepalive_action')
-        clear_notify_key(acc, 'keepalive_failed')
-        clear_pending_keepalive(acc)
-    context.bot.send_message(chat_id=get_chat_id(update), text='⏸ 全局自动保活已暂停。超流量仍会关机。')
+    acc = find_account(selector_from_args(context), include_disabled=True)
+    if not acc:
+        context.bot.send_message(chat_id=get_chat_id(update), text='没有找到账号。用法：/keepoff 账号名或序号')
+        return
+    accounts = load_accounts(include_disabled=True)
+    for item in accounts:
+        if account_key(item) == account_key(acc):
+            item['auto_keepalive'] = False
+            break
+    save_accounts(accounts)
+    clear_notify_key(acc, 'keepalive_action')
+    clear_notify_key(acc, 'keepalive_failed')
+    clear_pending_keepalive(acc)
+    context.bot.send_message(chat_id=get_chat_id(update), text=f'⏸ 已关闭账号自动保活：{account_name(acc)}。超流量仍会关机。')
 
 
 @run_async
@@ -990,6 +1076,12 @@ def main():
             return
         if cmd == '--disable-account':
             set_account_enabled_cli(False)
+            return
+        if cmd == '--enable-keepalive-account':
+            set_account_keepalive_cli(True)
+            return
+        if cmd == '--disable-keepalive-account':
+            set_account_keepalive_cli(False)
             return
         if cmd == '--status-account':
             status_account_cli()

@@ -49,7 +49,7 @@ account_menu(){
   while true; do
     clear
     echo "=============================="
-    echo " 账号 ${idx} 控制菜单"
+    echo " 账号 ${idx} 单独控制"
     echo "=============================="
     run_app --list-accounts | sed -n "1p;$((idx+1))p" || true
     echo "=============================="
@@ -58,10 +58,12 @@ account_menu(){
     echo "3. 手动开机这个账号实例"
     echo "4. 手动关机这个账号实例"
     echo "5. 立即执行一次这个账号检查"
-    echo "6. 编辑这个账号"
-    echo "7. 启用这个账号"
-    echo "8. 禁用这个账号"
-    echo "9. 删除这个账号"
+    echo "6. 开启这个账号自动保活"
+    echo "7. 关闭这个账号自动保活"
+    echo "8. 编辑这个账号"
+    echo "9. 启用这个账号"
+    echo "10. 禁用这个账号"
+    echo "11. 删除这个账号"
     echo "0. 返回账号列表"
     echo "=============================="
     read -r -p "请输入选项: " c
@@ -71,10 +73,12 @@ account_menu(){
       3) run_app --start-account "$idx"; pause;;
       4) run_app --stop-account "$idx"; pause;;
       5) run_app --cron-account "$idx"; pause;;
-      6) run_app --edit-account "$idx"; restart_bot_quiet; pause;;
-      7) run_app --enable-account "$idx"; restart_bot_quiet; pause;;
-      8) run_app --disable-account "$idx"; restart_bot_quiet; pause;;
-      9) run_app --delete-account "$idx"; restart_bot_quiet; return;;
+      6) run_app --enable-keepalive-account "$idx"; restart_bot_quiet; pause;;
+      7) run_app --disable-keepalive-account "$idx"; restart_bot_quiet; pause;;
+      8) run_app --edit-account "$idx"; restart_bot_quiet; pause;;
+      9) run_app --enable-account "$idx"; restart_bot_quiet; pause;;
+      10) run_app --disable-account "$idx"; restart_bot_quiet; pause;;
+      11) run_app --delete-account "$idx"; restart_bot_quiet; return;;
       0) return;;
       *) echo "无效选项"; pause;;
     esac
@@ -85,25 +89,23 @@ global_menu(){
   while true; do
     clear
     echo "=============================="
-    echo " 全局设置 / 工具"
+    echo " 服务 / 日志 / 工具"
+    echo "=============================="
+    echo "说明：开机、关机、日报、检查、保活都在账号菜单里单独控制。"
     echo "=============================="
     echo "1. 查看 TG Bot 服务状态"
     echo "2. 启动 TG Bot 服务"
     echo "3. 停止 TG Bot 服务"
     echo "4. 重启 TG Bot 服务"
-    echo "5. 开启全局自动保活"
-    echo "6. 关闭全局自动保活"
-    echo "7. 立即执行所有账号检查"
-    echo "8. 立即发送所有账号日报到频道"
-    echo "9. 查看最近日志"
-    echo "10. 查看实时 cron 日志"
-    echo "11. 查看当前 crontab"
-    echo "12. 查看系统时间/时区"
-    echo "13. 查看通知状态文件"
-    echo "14. 查看 accounts.json"
-    echo "15. 手动编辑 accounts.json"
-    echo "16. 编辑主程序文件"
-    echo "17. 备份 accounts.json"
+    echo "5. 查看最近日志"
+    echo "6. 查看实时 cron 日志"
+    echo "7. 查看当前 crontab"
+    echo "8. 查看系统时间/时区"
+    echo "9. 查看通知状态文件"
+    echo "10. 查看 accounts.json"
+    echo "11. 手动编辑 accounts.json"
+    echo "12. 编辑主程序文件"
+    echo "13. 备份 accounts.json"
     echo "0. 返回账号列表"
     echo "=============================="
     read -r -p "请输入选项: " choice
@@ -112,19 +114,15 @@ global_menu(){
       2) start_bot; pause;;
       3) stop_bot; pause;;
       4) restart_bot; pause;;
-      5) enable_keepalive; pause;;
-      6) disable_keepalive; pause;;
-      7) run_app --cron; echo "已执行一次所有账号检查"; pause;;
-      8) send_all_report_now; pause;;
-      9) show_last_logs; pause;;
-      10) live_logs; pause;;
-      11) show_crontab; pause;;
-      12) show_time; pause;;
-      13) show_notify_state; pause;;
-      14) show_accounts_json; pause;;
-      15) backup_accounts; edit_accounts_json; restart_bot_quiet; pause;;
-      16) edit_config; restart_bot_quiet; pause;;
-      17) backup_accounts; pause;;
+      5) show_last_logs; pause;;
+      6) live_logs; pause;;
+      7) show_crontab; pause;;
+      8) show_time; pause;;
+      9) show_notify_state; pause;;
+      10) show_accounts_json; pause;;
+      11) backup_accounts; edit_accounts_json; restart_bot_quiet; pause;;
+      12) edit_config; restart_bot_quiet; pause;;
+      13) backup_accounts; pause;;
       0) return;;
       *) echo "无效选项"; pause;;
     esac
@@ -143,7 +141,7 @@ main_menu(){
     echo "输入账号序号：进入单账号控制"
     echo "a. 增加账号"
     echo "d. 删除账号"
-    echo "g. 全局设置 / 服务 / 日志"
+    echo "g. 服务 / 日志 / 工具"
     echo "u. 完全卸载程序"
     echo "0. 退出"
     echo "=============================="
