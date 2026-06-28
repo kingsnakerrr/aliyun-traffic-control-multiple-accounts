@@ -49,9 +49,9 @@ account_menu(){
   while true; do
     clear
     echo "=============================="
-    echo " 账号 ${idx} 单独控制"
+    echo " 当前账号单独控制"
     echo "=============================="
-    run_app --list-accounts 2>/dev/null | sed -n "1p;$((idx+1))p" || true
+    run_app --list-accounts 2>/dev/null | sed -n "$((idx+1))p" || true
     echo "=============================="
     echo "1. 查看这个账号状态"
     echo "2. 立即发送这个账号日报到频道"
@@ -85,50 +85,6 @@ account_menu(){
   done
 }
 
-global_menu(){
-  while true; do
-    clear
-    echo "=============================="
-    echo " 服务 / 日志 / 工具"
-    echo "=============================="
-    echo "说明：开机、关机、日报、检查、保活都在账号菜单里单独控制。"
-    echo "=============================="
-    echo "1. 查看 TG Bot 服务状态"
-    echo "2. 启动 TG Bot 服务"
-    echo "3. 停止 TG Bot 服务"
-    echo "4. 重启 TG Bot 服务"
-    echo "5. 查看最近日志"
-    echo "6. 查看实时 cron 日志"
-    echo "7. 查看当前 crontab"
-    echo "8. 查看系统时间/时区"
-    echo "9. 查看通知状态文件"
-    echo "10. 查看 accounts.json"
-    echo "11. 手动编辑 accounts.json"
-    echo "12. 编辑主程序文件"
-    echo "13. 备份 accounts.json"
-    echo "0. 返回账号列表"
-    echo "=============================="
-    read -r -p "请输入选项: " choice
-    case "$choice" in
-      1) service_status; pause;;
-      2) start_bot; pause;;
-      3) stop_bot; pause;;
-      4) restart_bot; pause;;
-      5) show_last_logs; pause;;
-      6) live_logs; pause;;
-      7) show_crontab; pause;;
-      8) show_time; pause;;
-      9) show_notify_state; pause;;
-      10) show_accounts_json; pause;;
-      11) backup_accounts; edit_accounts_json; restart_bot_quiet; pause;;
-      12) edit_config; restart_bot_quiet; pause;;
-      13) backup_accounts; pause;;
-      0) return;;
-      *) echo "无效选项"; pause;;
-    esac
-  done
-}
-
 main_menu(){
   while true; do
     clear
@@ -138,10 +94,9 @@ main_menu(){
     echo "账号列表："
     run_app --list-accounts 2>/dev/null || true
     echo "=============================="
-    echo "输入账号序号：进入单账号控制"
+    echo "输入账号序号：进入该账号单独控制"
     echo "a. 增加账号"
     echo "d. 删除账号"
-    echo "g. 服务 / 日志 / 工具"
     echo "u. 完全卸载程序"
     echo "0. 退出"
     echo "=============================="
@@ -150,7 +105,6 @@ main_menu(){
       0) exit 0;;
       a|A) run_app --add-account; restart_bot_quiet; pause;;
       d|D) run_app --delete-account; restart_bot_quiet; pause;;
-      g|G) global_menu;;
       u|U) uninstall_all;;
       ''|*[!0-9]*) echo "无效选项"; pause;;
       *)
