@@ -716,12 +716,28 @@ def add_account_cli():
     print(f'✅ 已增加账号：{account_name(acc)}')
 
 
+def account_count_cli():
+    print(len(load_accounts(include_disabled=True)))
+
+
+def account_selector_from_argv(default_prompt='请输入账号序号或名称: '):
+    if len(sys.argv) >= 3 and str(sys.argv[2]).strip():
+        return str(sys.argv[2]).strip()
+    list_accounts_cli()
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        return None
+    return input(default_prompt).strip()
+
+
 def delete_account_cli():
     accounts = load_accounts(include_disabled=True)
-    list_accounts_cli()
     if not accounts:
+        print('暂无账号。')
         return
-    val = input('请输入要删除的账号序号或名称: ').strip()
+    val = account_selector_from_argv('请输入要删除的账号序号或名称: ')
+    if not val:
+        return
     acc = find_account(val, include_disabled=True)
     if not acc:
         print('没有找到这个账号。')
@@ -738,10 +754,12 @@ def delete_account_cli():
 
 def edit_account_cli():
     accounts = load_accounts(include_disabled=True)
-    list_accounts_cli()
     if not accounts:
+        print('暂无账号。')
         return
-    val = input('请输入要编辑的账号序号或名称: ').strip()
+    val = account_selector_from_argv('请输入要编辑的账号序号或名称: ')
+    if not val:
+        return
     target = find_account(val, include_disabled=True)
     if not target:
         print('没有找到这个账号。')
@@ -760,10 +778,12 @@ def edit_account_cli():
 
 def set_account_enabled_cli(enabled: bool):
     accounts = load_accounts(include_disabled=True)
-    list_accounts_cli()
     if not accounts:
+        print('暂无账号。')
         return
-    val = input('请输入账号序号或名称: ').strip()
+    val = account_selector_from_argv('请输入账号序号或名称: ')
+    if not val:
+        return
     target = find_account(val, include_disabled=True)
     if not target:
         print('没有找到这个账号。')
@@ -775,6 +795,51 @@ def set_account_enabled_cli(enabled: bool):
             break
     save_accounts(accounts)
     print(f'✅ 已{"启用" if enabled else "禁用"}账号：{account_name(target)}')
+
+
+def get_selected_account_cli(include_disabled=True):
+    val = account_selector_from_argv()
+    if not val:
+        return None
+    acc = find_account(val, include_disabled=include_disabled)
+    if not acc:
+        print('没有找到这个账号。')
+        return None
+    return acc
+
+
+def status_account_cli():
+    acc = get_selected_account_cli(include_disabled=True)
+    if acc:
+        print(build_status_text(acc))
+
+
+def report_account_cli():
+    acc = get_selected_account_cli(include_disabled=True)
+    if acc:
+        send_tg(TELEGRAM_CHAT_ID, build_status_text(acc))
+        print(f'✅ 已发送账号日报到频道：{account_name(acc)}')
+
+
+def start_account_cli():
+    acc = get_selected_account_cli(include_disabled=True)
+    if acc:
+        ok, result = start_vps_safety(acc)
+        print(result)
+
+
+def stop_account_cli():
+    acc = get_selected_account_cli(include_disabled=True)
+    if acc:
+        ok, result = stop_vps_safety(acc)
+        print(result)
+
+
+def cron_account_cli():
+    acc = get_selected_account_cli(include_disabled=True)
+    if acc:
+        check_one_account(acc)
+        print(f'✅ 已执行一次账号检查：{account_name(acc)}')
 
 # =========================
 # Bot 命令
@@ -908,6 +973,9 @@ def main():
         if cmd == '--list-accounts':
             list_accounts_cli()
             return
+        if cmd == '--account-count':
+            account_count_cli()
+            return
         if cmd == '--add-account':
             add_account_cli()
             return
@@ -922,6 +990,21 @@ def main():
             return
         if cmd == '--disable-account':
             set_account_enabled_cli(False)
+            return
+        if cmd == '--status-account':
+            status_account_cli()
+            return
+        if cmd == '--report-account':
+            report_account_cli()
+            return
+        if cmd == '--start-account':
+            start_account_cli()
+            return
+        if cmd == '--stop-account':
+            stop_account_cli()
+            return
+        if cmd == '--cron-account':
+            cron_account_cli()
             return
         if cmd == '--status-all':
             print(build_all_status_text())

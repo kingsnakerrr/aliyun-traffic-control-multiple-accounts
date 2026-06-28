@@ -10,14 +10,14 @@ ACCOUNTS_FILE="${BASE_DIR}/accounts.json"
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "请使用 root 用户运行"; exit 1; }; }
 pause(){ echo; read -r -p "按回车返回菜单..."; }
 run_app(){ "$PY" "$APP" "$@"; }
+restart_bot_quiet(){ systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true; }
 service_status(){ systemctl status "$SERVICE_NAME" -l --no-pager || true; }
 start_bot(){ systemctl start "$SERVICE_NAME"; echo "已启动 TG Bot 服务"; }
 stop_bot(){ systemctl stop "$SERVICE_NAME"; echo "已停止 TG Bot 服务"; }
 restart_bot(){ systemctl restart "$SERVICE_NAME"; echo "已重启 TG Bot 服务"; }
 enable_keepalive(){ touch "${BASE_DIR}/keepalive_enabled.flag"; echo "已开启全局自动保活"; }
 disable_keepalive(){ rm -f "${BASE_DIR}/keepalive_enabled.flag"; echo "已关闭全局自动保活"; }
-restart_keepalive(){ touch "${BASE_DIR}/keepalive_enabled.flag"; run_app --cron; echo "已执行一次多账号保活检查"; }
-send_report_now(){ run_app --report; echo "已立即发送所有账号日报到频道"; }
+send_all_report_now(){ run_app --report; echo "已立即发送所有账号日报到频道"; }
 show_last_logs(){ echo "===== cron_run.log 最近40行 ====="; tail -n 40 "${BASE_DIR}/cron_run.log" 2>/dev/null || echo "暂无 cron_run.log"; echo; echo "===== systemd 最近30行 ====="; journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true; }
 live_logs(){ echo "实时日志：Ctrl+C 退出"; touch "${BASE_DIR}/cron_run.log"; tail -n 30 -f "${BASE_DIR}/cron_run.log"; }
 show_crontab(){ echo "===== 当前 root crontab ====="; crontab -l 2>/dev/null || echo "当前没有 crontab"; }
@@ -27,71 +27,85 @@ show_accounts_json(){ echo "===== accounts.json ====="; cat "$ACCOUNTS_FILE" 2>/
 edit_accounts_json(){ ${EDITOR:-nano} "$ACCOUNTS_FILE"; echo "修改完成后建议重启服务：systemctl restart traffic-control"; }
 edit_config(){ ${EDITOR:-nano} "$APP"; echo "修改完成后建议重启服务：systemctl restart traffic-control"; }
 backup_accounts(){ cp -a "$ACCOUNTS_FILE" "${ACCOUNTS_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true; echo "已备份 accounts.json 到同目录 .bak 文件"; }
-uninstall_all(){ echo "即将完全卸载程序"; read -r -p "确定卸载？输入 yes 继续: " ans; [ "$ans" = "yes" ] || { echo "已取消"; return; }; systemctl stop "$SERVICE_NAME" 2>/dev/null || true; systemctl disable "$SERVICE_NAME" 2>/dev/null || true; rm -f "/etc/systemd/system/${SERVICE_NAME}"; systemctl daemon-reload || true; crontab -l 2>/dev/null | grep -v "aliyun-traffic-control/traffic_control.py" | crontab - || true; rm -f /usr/local/bin/cdt; rm -rf "$BASE_DIR"; echo "卸载完成"; exit 0; }
+account_count(){ run_app --account-count 2>/dev/null || echo 0; }
 
-accounts_menu(){
+uninstall_all(){
+  echo "即将完全卸载程序：服务、cron、/usr/local/bin/cdt、${BASE_DIR} 都会删除。"
+  read -r -p "确定卸载？输入 yes 继续: " ans
+  [ "$ans" = "yes" ] || { echo "已取消"; return; }
+  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SERVICE_NAME}"
+  systemctl daemon-reload || true
+  crontab -l 2>/dev/null | grep -v "aliyun-traffic-control/traffic_control.py" | crontab - || true
+  rm -f /usr/local/bin/cdt
+  rm -rf "$BASE_DIR"
+  echo "卸载完成"
+  exit 0
+}
+
+account_menu(){
+  local idx="$1"
   while true; do
     clear
     echo "=============================="
-    echo " 多账号管理"
+    echo " 账号 ${idx} 控制菜单"
     echo "=============================="
-    echo "1. 查看账号列表"
-    echo "2. 增加账号"
-    echo "3. 删除账号"
-    echo "4. 编辑账号"
-    echo "5. 启用账号"
-    echo "6. 禁用账号"
-    echo "7. 查看 accounts.json"
-    echo "8. 手动编辑 accounts.json"
-    echo "9. 备份 accounts.json"
-    echo "0. 返回主菜单"
+    run_app --list-accounts | sed -n "1p;$((idx+1))p" || true
+    echo "=============================="
+    echo "1. 查看这个账号状态"
+    echo "2. 立即发送这个账号日报到频道"
+    echo "3. 手动开机这个账号实例"
+    echo "4. 手动关机这个账号实例"
+    echo "5. 立即执行一次这个账号检查"
+    echo "6. 编辑这个账号"
+    echo "7. 启用这个账号"
+    echo "8. 禁用这个账号"
+    echo "9. 删除这个账号"
+    echo "0. 返回账号列表"
     echo "=============================="
     read -r -p "请输入选项: " c
     case "$c" in
-      1) run_app --list-accounts; pause;;
-      2) run_app --add-account; restart_bot; pause;;
-      3) run_app --delete-account; restart_bot; pause;;
-      4) run_app --edit-account; restart_bot; pause;;
-      5) run_app --enable-account; restart_bot; pause;;
-      6) run_app --disable-account; restart_bot; pause;;
-      7) show_accounts_json; pause;;
-      8) backup_accounts; edit_accounts_json; restart_bot; pause;;
-      9) backup_accounts; pause;;
+      1) run_app --status-account "$idx"; pause;;
+      2) run_app --report-account "$idx"; pause;;
+      3) run_app --start-account "$idx"; pause;;
+      4) run_app --stop-account "$idx"; pause;;
+      5) run_app --cron-account "$idx"; pause;;
+      6) run_app --edit-account "$idx"; restart_bot_quiet; pause;;
+      7) run_app --enable-account "$idx"; restart_bot_quiet; pause;;
+      8) run_app --disable-account "$idx"; restart_bot_quiet; pause;;
+      9) run_app --delete-account "$idx"; restart_bot_quiet; return;;
       0) return;;
       *) echo "无效选项"; pause;;
     esac
   done
 }
 
-menu(){
-  clear
-  echo "=============================="
-  echo " 阿里云 CDT 流量控制菜单（多账号版）"
-  echo "=============================="
-  echo "1. 查看服务状态"
-  echo "2. 启动 TG Bot 服务"
-  echo "3. 停止 TG Bot 服务"
-  echo "4. 重启 TG Bot 服务"
-  echo "5. 开启全局自动保活"
-  echo "6. 关闭全局自动保活"
-  echo "7. 重启/立即执行一次保活检查"
-  echo "8. 立即发送所有账号日报到频道（测试）"
-  echo "9. 查看最近日志"
-  echo "10. 查看实时 cron 日志"
-  echo "11. 查看当前 crontab"
-  echo "12. 编辑主程序文件"
-  echo "13. 查看系统时间/时区"
-  echo "14. 查看通知状态文件"
-  echo "15. 多账号管理"
-  echo "16. 完全卸载程序"
-  echo "0. 退出"
-  echo "=============================="
-}
-
-main(){
-  need_root
+global_menu(){
   while true; do
-    menu
+    clear
+    echo "=============================="
+    echo " 全局设置 / 工具"
+    echo "=============================="
+    echo "1. 查看 TG Bot 服务状态"
+    echo "2. 启动 TG Bot 服务"
+    echo "3. 停止 TG Bot 服务"
+    echo "4. 重启 TG Bot 服务"
+    echo "5. 开启全局自动保活"
+    echo "6. 关闭全局自动保活"
+    echo "7. 立即执行所有账号检查"
+    echo "8. 立即发送所有账号日报到频道"
+    echo "9. 查看最近日志"
+    echo "10. 查看实时 cron 日志"
+    echo "11. 查看当前 crontab"
+    echo "12. 查看系统时间/时区"
+    echo "13. 查看通知状态文件"
+    echo "14. 查看 accounts.json"
+    echo "15. 手动编辑 accounts.json"
+    echo "16. 编辑主程序文件"
+    echo "17. 备份 accounts.json"
+    echo "0. 返回账号列表"
+    echo "=============================="
     read -r -p "请输入选项: " choice
     case "$choice" in
       1) service_status; pause;;
@@ -100,20 +114,59 @@ main(){
       4) restart_bot; pause;;
       5) enable_keepalive; pause;;
       6) disable_keepalive; pause;;
-      7) restart_keepalive; pause;;
-      8) send_report_now; pause;;
+      7) run_app --cron; echo "已执行一次所有账号检查"; pause;;
+      8) send_all_report_now; pause;;
       9) show_last_logs; pause;;
       10) live_logs; pause;;
       11) show_crontab; pause;;
-      12) edit_config; pause;;
-      13) show_time; pause;;
-      14) show_notify_state; pause;;
-      15) accounts_menu;;
-      16) uninstall_all;;
-      0) exit 0;;
+      12) show_time; pause;;
+      13) show_notify_state; pause;;
+      14) show_accounts_json; pause;;
+      15) backup_accounts; edit_accounts_json; restart_bot_quiet; pause;;
+      16) edit_config; restart_bot_quiet; pause;;
+      17) backup_accounts; pause;;
+      0) return;;
       *) echo "无效选项"; pause;;
     esac
   done
 }
 
-main "$@"
+main_menu(){
+  while true; do
+    clear
+    echo "=============================="
+    echo " 阿里云 CDT 多账号控制"
+    echo "=============================="
+    echo "账号列表："
+    run_app --list-accounts || true
+    echo "=============================="
+    echo "输入账号序号：进入单账号控制"
+    echo "a. 增加账号"
+    echo "d. 删除账号"
+    echo "g. 全局设置 / 服务 / 日志"
+    echo "u. 完全卸载程序"
+    echo "0. 退出"
+    echo "=============================="
+    read -r -p "请选择: " choice
+    case "$choice" in
+      0) exit 0;;
+      a|A) run_app --add-account; restart_bot_quiet; pause;;
+      d|D) run_app --delete-account; restart_bot_quiet; pause;;
+      g|G) global_menu;;
+      u|U) uninstall_all;;
+      ''|*[!0-9]*) echo "无效选项"; pause;;
+      *)
+        count="$(account_count)"
+        if [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "$count" ] 2>/dev/null; then
+          account_menu "$choice"
+        else
+          echo "没有这个账号序号"
+          pause
+        fi
+        ;;
+    esac
+  done
+}
+
+need_root
+main_menu
