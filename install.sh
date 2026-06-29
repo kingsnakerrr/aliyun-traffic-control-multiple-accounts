@@ -50,6 +50,10 @@ if command -v apt >/dev/null 2>&1; then
   apt install -y python3 python3-venv python3-pip curl ca-certificates cron
 elif command -v yum >/dev/null 2>&1; then
   yum install -y python3 python3-pip curl ca-certificates cronie
+  yum install -y python3-virtualenv || true
+else
+  echo "未检测到 apt 或 yum，请先安装 python3、pip、curl 和 cron 后再运行。"
+  exit 1
 fi
 
 if command -v timedatectl >/dev/null 2>&1; then
@@ -83,6 +87,10 @@ python3 - <<'PYACCOUNTS'
 from pathlib import Path
 import os, json
 base = Path('/root/aliyun-traffic-control')
+try:
+    max_traffic = float(os.environ.get('MAX_TRAFFIC_GB') or '180')
+except ValueError:
+    max_traffic = 180.0
 accounts = [{
     'name': os.environ['ACCOUNT_NAME'],
     'access_key_id': os.environ['ACCESS_KEY_ID'],
@@ -90,9 +98,10 @@ accounts = [{
     'region_id': os.environ['REGION_ID'],
     'instance_id': os.environ['INSTANCE_ID'],
     'bill_region_id': os.environ['BILL_REG_ID'],
-    'max_traffic_gb': float(os.environ['MAX_TRAFFIC_GB']),
+    'max_traffic_gb': max_traffic,
     'is_international': os.environ['IS_INTERNATIONAL'].lower() == 'true',
     'daily_report_time': os.environ['REPORT_TIME'],
+    'auto_keepalive': True,
     'enabled': True,
 }]
 (base / 'accounts.json').write_text(json.dumps(accounts, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -100,7 +109,10 @@ os.chmod(base / 'accounts.json', 0o600)
 PYACCOUNTS
 
 chmod +x "${BASE_DIR}/traffic_control.py"
-python3 -m venv "${BASE_DIR}/venv"
+if ! python3 -m venv "${BASE_DIR}/venv"; then
+  python3 -m pip install --upgrade virtualenv
+  python3 -m virtualenv "${BASE_DIR}/venv"
+fi
 "${BASE_DIR}/venv/bin/pip" install --upgrade pip
 "${BASE_DIR}/venv/bin/pip" install aliyun-python-sdk-core aliyun-python-sdk-ecs aliyun-python-sdk-bssopenapi requests python-telegram-bot==13.15 APScheduler==3.6.3 pytz
 

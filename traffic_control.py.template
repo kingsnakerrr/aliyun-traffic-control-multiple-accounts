@@ -5,9 +5,16 @@ import os
 import sys
 import json
 import re
+import tempfile
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 import requests
 from aliyunsdkcore.client import AcsClient
@@ -32,6 +39,7 @@ BASE_DIR = '/root/aliyun-traffic-control'
 ACCOUNTS_FILE = os.path.join(BASE_DIR, 'accounts.json')
 KEEPALIVE_FLAG_FILE = os.path.join(BASE_DIR, 'keepalive_enabled.flag')
 LAST_NOTIFY_FILE = os.path.join(BASE_DIR, 'last_notify_state.json')
+NOTIFY_LOCK_FILE = os.path.join(BASE_DIR, 'last_notify_state.lock')
 
 MONTHLY_RESET_OPEN_HOUR = 0
 MONTHLY_RESET_OPEN_MINUTE = 5
@@ -122,8 +130,15 @@ def normalize_bool(value) -> bool:
 
 
 def account_key(account: Dict[str, Any]) -> str:
-    raw = str(account.get('name') or account.get('instance_id') or 'account')
-    key = re.sub(r'[^A-Za-z0-9_\-]+', '_', raw).strip('_')
+    # 优先使用机器可唯一识别的字段，避免中文账号名清洗后都变成同一个 key。
+    raw = str(
+        account.get('id') or
+        account.get('instance_id') or
+        account.get('access_key_id') or
+        account.get('name') or
+        'account'
+    )
+    key = re.sub(r'[^A-Za-z0-9_\-:.]+', '_', raw).strip('_')
     return key or 'account'
 
 
@@ -241,21 +256,63 @@ def get_chat_id(update: Update):
     return update.effective_chat.id if update.effective_chat else ADMIN_USER_ID
 
 
-def load_notify_state():
+@contextmanager
+def notify_state_lock():
+    ensure_base_dir()
+    lock_f = open(NOTIFY_LOCK_FILE, 'w', encoding='utf-8')
+    try:
+        if fcntl:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl:
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        lock_f.close()
+
+
+def _load_notify_state_unlocked():
     try:
         if not os.path.exists(LAST_NOTIFY_FILE):
             return {}
         with open(LAST_NOTIFY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
+def _save_notify_state_unlocked(state):
+    ensure_base_dir()
+    fd, tmp_path = tempfile.mkstemp(prefix='.last_notify_state.', suffix='.tmp', dir=BASE_DIR)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        os.replace(tmp_path, LAST_NOTIFY_FILE)
+        try:
+            os.chmod(LAST_NOTIFY_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def load_notify_state():
+    with notify_state_lock():
+        return _load_notify_state_unlocked()
+
+
 def save_notify_state(state):
     try:
-        ensure_base_dir()
-        with open(LAST_NOTIFY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        with notify_state_lock():
+            _save_notify_state_unlocked(state)
     except Exception as e:
         logging.error(f'保存通知状态失败: {str(e)}')
 
@@ -266,22 +323,24 @@ def scoped_key(account: Dict[str, Any], suffix: str) -> str:
 
 def notify_once(account: Dict[str, Any], suffix: str, text: str):
     key = scoped_key(account, suffix)
-    state = load_notify_state()
-    if state.get(key):
-        return False
-    if send_tg(TELEGRAM_CHAT_ID, text):
-        state[key] = now_text()
-        save_notify_state(state)
-        return True
+    with notify_state_lock():
+        state = _load_notify_state_unlocked()
+        if state.get(key):
+            return False
+        if send_tg(TELEGRAM_CHAT_ID, text):
+            state[key] = now_text()
+            _save_notify_state_unlocked(state)
+            return True
     return False
 
 
 def clear_notify_key(account: Dict[str, Any], suffix: str):
     key = scoped_key(account, suffix)
-    state = load_notify_state()
-    if key in state:
-        del state[key]
-        save_notify_state(state)
+    with notify_state_lock():
+        state = _load_notify_state_unlocked()
+        if key in state:
+            del state[key]
+            _save_notify_state_unlocked(state)
 
 
 def has_notify_key(account: Dict[str, Any], suffix: str) -> bool:
@@ -290,16 +349,22 @@ def has_notify_key(account: Dict[str, Any], suffix: str) -> bool:
 
 def clear_account_notify_state(account: Dict[str, Any]):
     prefix = f'{account_key(account)}::'
-    state = load_notify_state()
-    new_state = {k: v for k, v in state.items() if not k.startswith(prefix)}
-    if len(new_state) != len(state):
-        save_notify_state(new_state)
+    with notify_state_lock():
+        state = _load_notify_state_unlocked()
+        new_state = {k: v for k, v in state.items() if not k.startswith(prefix)}
+        if len(new_state) != len(state):
+            _save_notify_state_unlocked(new_state)
+
+
+def set_notify_key(account: Dict[str, Any], suffix: str, value=None):
+    with notify_state_lock():
+        state = _load_notify_state_unlocked()
+        state[scoped_key(account, suffix)] = now_text() if value is None else value
+        _save_notify_state_unlocked(state)
 
 
 def set_pending_keepalive(account: Dict[str, Any], status: str):
-    state = load_notify_state()
-    state[scoped_key(account, 'keepalive_pending')] = {'time': now_text(), 'status': status}
-    save_notify_state(state)
+    set_notify_key(account, 'keepalive_pending', {'time': now_text(), 'status': status})
 
 
 def get_pending_keepalive(account: Dict[str, Any]):
@@ -366,8 +431,12 @@ def start_vps_safety(account: Dict[str, Any]) -> Tuple[bool, str]:
         status_l = status.lower()
         if status_l == 'running':
             return True, '✅ 实例已经是 Running，无需开机'
-        if status_l in ['starting', 'stopping']:
-            return True, f'⏳ 实例当前是 {status}，正在变化中，等待恢复 Running'
+        if status_l == 'starting':
+            return True, f'⏳ 实例当前是 {status}，正在启动中，等待恢复 Running'
+        if status_l == 'stopping':
+            return False, f'⏳ 实例当前是 {status}，正在关机中，等待状态稳定后再开机'
+        if status_l == 'unknown':
+            return False, '❌ 无法确认实例状态，已跳过开机，避免误操作'
         request = StartInstanceRequest.StartInstanceRequest()
         request.set_InstanceId(instance_id)
         ecs_client(account).do_action_with_exception(request)
@@ -401,7 +470,7 @@ def stop_vps_safety(account: Dict[str, Any]) -> Tuple[bool, str]:
 # CDT 和账单
 # =========================
 
-def get_cdt_traffic(account: Dict[str, Any]) -> float:
+def get_cdt_traffic(account: Dict[str, Any]) -> Optional[float]:
     request = CommonRequest()
     request.set_domain('cdt.aliyuncs.com')
     request.set_version('2021-08-13')
@@ -414,7 +483,7 @@ def get_cdt_traffic(account: Dict[str, Any]) -> float:
         return round(total_bytes / (1024 ** 3), 2)
     except Exception as e:
         logging.error(f'[{account_name(account)}] CDT流量查询失败: {str(e)}')
-        return 0.0
+        return None
 
 
 def get_aliyun_data(account: Dict[str, Any]) -> str:
@@ -454,6 +523,16 @@ def max_gb(account: Dict[str, Any]) -> float:
     return safe_float(account.get('max_traffic_gb'), DEFAULT_MAX_TRAFFIC_GB)
 
 
+def traffic_text(traffic: Optional[float]) -> str:
+    return '查询失败' if traffic is None else f'{traffic} GB'
+
+
+def traffic_with_limit_text(account: Dict[str, Any], traffic: Optional[float]) -> str:
+    if traffic is None:
+        return f'查询失败 / {max_gb(account):g} GB'
+    return f'{traffic} GB / {max_gb(account):g} GB'
+
+
 def account_runtime_status(account: Dict[str, Any], instance_status: Optional[str] = None) -> str:
     """给 cdt 首页和通知用的人话状态。
     traffic_stop/manual_stop 只记录本程序触发的原因；如果用户在阿里云后台关机，显示为未知原因关机。
@@ -490,7 +569,7 @@ def build_status_text(account: Dict[str, Any]) -> str:
         f'📊 阿里云账号 {account_name(account)} - CDT服务器\n\n'
         '----------------------------------\n'
         f'⏰ 时间：{now_text()}\n'
-        f'📡 当前流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'📡 当前流量：{traffic_with_limit_text(account, traffic)}\n'
         f'🖥 实例状态：{instance_status}\n'
         f'📌 当前状态：{runtime_status}\n'
         f'🌍 ECS区域：{account.get("region_id")}\n'
@@ -521,8 +600,8 @@ def build_help_text() -> str:
         '/report - 立即发送所有账号报告到频道\n'
         '/startvps 账号名或序号 - 给指定账号开机，不填则默认第1个\n'
         '/stopvps 账号名或序号 - 给指定账号关机，不填则默认第1个\n'
-        '/keepon - 开启全局自动保活\n'
-        '/keepoff - 暂停全局自动保活\n'
+        '/keepon 账号名或序号 - 开启指定账号自动保活\n'
+        '/keepoff 账号名或序号 - 暂停指定账号自动保活\n'
         '/help - 查看命令帮助\n\n'
         '说明：\n'
         '1. 机器人只接受管理员私聊命令。\n'
@@ -536,7 +615,7 @@ def build_keepalive_success_notice(account, old_status, traffic):
     return (
         f'〖保活恢复成功〗\n\n账号：{account_name(account)}\n'
         f'之前状态：{old_status}\n当前状态：Running\n\n'
-        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'当前 CDT 流量：{traffic_with_limit_text(account, traffic)}\n'
         f'实例：{account.get("instance_id")}\n时间：{now_text()}'
     )
 
@@ -545,7 +624,7 @@ def build_keepalive_action_notice(account, old_status, result_msg, traffic):
     return (
         f'〖保活已触发〗\n\n账号：{account_name(account)}\n'
         f'检测到实例状态：{old_status}\n'
-        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'当前 CDT 流量：{traffic_with_limit_text(account, traffic)}\n'
         f'动作结果：{result_msg}\n\n'
         '系统已开始救活，等待实例恢复 Running 后会再次通知。\n'
         f'实例：{account.get("instance_id")}\n时间：{now_text()}'
@@ -555,7 +634,7 @@ def build_keepalive_action_notice(account, old_status, result_msg, traffic):
 def build_monthly_reset_start_notice(account, traffic, result_msg):
     return (
         f'〖月初流量恢复自动开机〗\n\n账号：{account_name(account)}\n'
-        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'当前 CDT 流量：{traffic_with_limit_text(account, traffic)}\n'
         f'自动开机条件：每月1号00:05以后 且 CDT流量 < {max_gb(account):g} GB\n'
         f'动作结果：{result_msg}\n\n'
         '系统判断免费额度已进入新账期或流量低于保护阈值，已执行自动开机。\n'
@@ -566,11 +645,21 @@ def build_monthly_reset_start_notice(account, traffic, result_msg):
 def build_traffic_stop_notice(account, traffic, result_msg):
     return (
         f'〖流量熔断关机通知〗\n\n账号：{account_name(account)}\n'
-        f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+        f'当前 CDT 流量：{traffic_with_limit_text(account, traffic)}\n'
         f'动作结果：{result_msg}\n\n'
         '系统已执行关机保护，避免继续产生流量费用。\n'
         f'下次自动检测开机：{get_next_cdt_reset_check_time()}\n'
         f'自动开机条件：到达检测时间后 CDT流量 < {max_gb(account):g} GB\n'
+        f'实例：{account.get("instance_id")}\n时间：{now_text()}'
+    )
+
+
+def build_cdt_query_failed_notice(account, instance_status):
+    return (
+        f'〖CDT流量查询失败〗\n\n账号：{account_name(account)}\n'
+        f'实例状态：{instance_status}\n'
+        f'保护动作：本轮已跳过自动开机/关机，避免把查询失败误判为 0GB。\n\n'
+        f'请检查 AccessKey 权限、CDT 接口可用性和网络连接。\n'
         f'实例：{account.get("instance_id")}\n时间：{now_text()}'
     )
 
@@ -584,14 +673,15 @@ def maybe_send_daily_report(account):
         if notify_once(account, suffix, build_status_text(account)):
             logging.info(f'[{account_name(account)}] 已发送每日 {account.get("daily_report_time")} 北京时间报告到频道。')
     else:
-        state = load_notify_state()
         prefix = f'{account_key(account)}::daily_report_'
         today_key = scoped_key(account, f'daily_report_{today_cn_str()}')
-        old_keys = [k for k in state if k.startswith(prefix) and k != today_key]
-        if old_keys:
-            for key in old_keys:
-                del state[key]
-            save_notify_state(state)
+        with notify_state_lock():
+            state = _load_notify_state_unlocked()
+            old_keys = [k for k in state if k.startswith(prefix) and k != today_key]
+            if old_keys:
+                for key in old_keys:
+                    del state[key]
+                _save_notify_state_unlocked(state)
 
 
 def check_one_account(account: Dict[str, Any]):
@@ -605,10 +695,17 @@ def check_one_account(account: Dict[str, Any]):
     traffic = get_cdt_traffic(account)
     status_before = get_vps_status(account)
     status_l = status_before.lower()
-    logging.info(f'[{account_name(account)}] cron检查：流量 {traffic} GB / {max_gb(account):g} GB，实例状态 {status_before}')
+    logging.info(f'[{account_name(account)}] cron检查：流量 {traffic_with_limit_text(account, traffic)}，实例状态 {status_before}')
 
     if now_cn().day != 1:
         clear_notify_key(account, 'monthly_reset_start')
+
+    if traffic is None:
+        logging.error(f'[{account_name(account)}] CDT流量查询失败，本轮跳过自动开关机，避免误判。')
+        notify_once(account, 'cdt_query_failed', build_cdt_query_failed_notice(account, status_before))
+        return
+
+    clear_notify_key(account, 'cdt_query_failed')
 
     if traffic >= max_gb(account):
         clear_notify_key(account, 'manual_stop')
@@ -636,7 +733,7 @@ def check_one_account(account: Dict[str, Any]):
         else:
             notify_once(account, 'keepalive_failed', (
                 f'〖月初自动开机失败〗\n\n账号：{account_name(account)}\n'
-                f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+                f'当前 CDT 流量：{traffic_with_limit_text(account, traffic)}\n'
                 f'失败原因：{result}\n\n请检查余额、实例状态、阿里云风控或实例是否已释放。\n'
                 f'实例：{account.get("instance_id")}\n时间：{now_text()}'
             ))
@@ -667,7 +764,7 @@ def check_one_account(account: Dict[str, Any]):
         notify_once(account, 'keepalive_failed', (
             f'〖保活启动失败〗\n\n账号：{account_name(account)}\n'
             f'检测到实例状态：{status_before}\n'
-            f'当前 CDT 流量：{traffic} GB / {max_gb(account):g} GB\n'
+            f'当前 CDT 流量：{traffic_with_limit_text(account, traffic)}\n'
             f'失败原因：{result}\n\n请检查余额、实例状态、阿里云风控或实例是否已释放。\n'
             f'实例：{account.get("instance_id")}\n时间：{now_text()}'
         ))
@@ -929,9 +1026,7 @@ def stop_account_cli():
         ok, result = stop_vps_safety(acc)
         if ok:
             clear_notify_key(acc, 'traffic_stop')
-            state = load_notify_state()
-            state[scoped_key(acc, 'manual_stop')] = now_text()
-            save_notify_state(state)
+            set_notify_key(acc, 'manual_stop')
         print(result)
 
 
@@ -977,7 +1072,7 @@ def traffic_command(update: Update, context: CallbackContext):
     for i, acc in enumerate(accounts, start=1):
         traffic = get_cdt_traffic(acc)
         enabled = '启用' if account_enabled(acc) else '禁用'
-        lines.append(f'{i}. {account_name(acc)}：{traffic} GB / {max_gb(acc):g} GB（{enabled}）')
+        lines.append(f'{i}. {account_name(acc)}：{traffic_with_limit_text(acc, traffic)}（{enabled}）')
     context.bot.send_message(chat_id=get_chat_id(update), text='\n'.join(lines))
 
 
@@ -1019,9 +1114,7 @@ def stopvps_command(update: Update, context: CallbackContext):
     ok, result = stop_vps_safety(acc)
     if ok:
         clear_notify_key(acc, 'traffic_stop')
-        state = load_notify_state()
-        state[scoped_key(acc, 'manual_stop')] = now_text()
-        save_notify_state(state)
+        set_notify_key(acc, 'manual_stop')
     context.bot.send_message(chat_id=get_chat_id(update), text=f'账号：{account_name(acc)}\n{result}')
 
 
