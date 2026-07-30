@@ -23,7 +23,7 @@ cdt
 新增或编辑账号时有两个区域字段：
 
 - `ECS 区域`：填实例真实所在地域。香港填 `cn-hongkong`，日本东京填 `ap-northeast-1`。
-- `账单接口区域`：一般保持默认 `cn-hangzhou`，它和 ECS 所在地域不是同一个概念。
+- `账单接口区域`：它和 ECS 所在地域不是同一个概念。国内版账号默认填 `cn-hangzhou`，国际版账号默认填 `ap-southeast-1`。
 
 常见 ECS 区域：
 
@@ -37,6 +37,18 @@ cdt
 上海：cn-shanghai
 北京：cn-beijing
 深圳：cn-shenzhen
+```
+
+示例：
+
+```text
+国内版账号，ECS 在香港：
+ECS 区域：cn-hongkong
+账单接口区域：cn-hangzhou
+
+国际版账号，ECS 在日本东京：
+ECS 区域：ap-northeast-1
+账单接口区域：ap-southeast-1
 ```
 
 ## cdt 菜单

@@ -46,12 +46,16 @@ MONTHLY_RESET_OPEN_MINUTE = 5
 DEFAULT_DAILY_REPORT_TIME = '09:00'
 DEFAULT_MAX_TRAFFIC_GB = 180.0
 DEFAULT_BILL_REGION_ID = 'cn-hangzhou'
+DEFAULT_INTERNATIONAL_BILL_REGION_ID = 'ap-southeast-1'
 ECS_REGION_HELP = (
     '常见 ECS 区域：香港 cn-hongkong，日本东京 ap-northeast-1，新加坡 ap-southeast-1，'
     '美国硅谷 us-west-1，美国弗吉尼亚 us-east-1，杭州 cn-hangzhou，上海 cn-shanghai，'
     '北京 cn-beijing，深圳 cn-shenzhen。ECS 区域必须填实例真实所在地域。'
 )
-BILL_REGION_HELP = '账单接口区域一般保持 cn-hangzhou，和 ECS 所在地域不是同一个概念。'
+BILL_REGION_HELP = (
+    '账单接口区域不是 ECS 区域：国内版账号一般填 cn-hangzhou；'
+    '国际版账号一般填 ap-southeast-1。'
+)
 
 # =========================
 # 日志
@@ -135,6 +139,12 @@ def normalize_bool(value) -> bool:
     return str(value).strip().lower() in ['1', 'true', 'yes', 'y', '是']
 
 
+def recommended_bill_region_id(is_international=False) -> str:
+    if normalize_bool(is_international):
+        return DEFAULT_INTERNATIONAL_BILL_REGION_ID
+    return DEFAULT_BILL_REGION_ID
+
+
 def account_key(account: Dict[str, Any]) -> str:
     # 优先使用机器可唯一识别的字段，避免中文账号名清洗后都变成同一个 key。
     raw = str(
@@ -173,10 +183,10 @@ def load_accounts(include_disabled: bool = False) -> List[Dict[str, Any]]:
             if not isinstance(acc, dict):
                 continue
             acc.setdefault('enabled', True)
-            acc.setdefault('bill_region_id', DEFAULT_BILL_REGION_ID)
             acc.setdefault('max_traffic_gb', DEFAULT_MAX_TRAFFIC_GB)
             acc.setdefault('daily_report_time', DEFAULT_DAILY_REPORT_TIME)
             acc.setdefault('is_international', False)
+            acc.setdefault('bill_region_id', recommended_bill_region_id(acc.get('is_international')))
             if include_disabled or account_enabled(acc):
                 normalized.append(acc)
         return normalized
@@ -228,7 +238,8 @@ def ecs_client(account: Dict[str, Any]) -> AcsClient:
 
 
 def bill_client(account: Dict[str, Any]) -> AcsClient:
-    return AcsClient(account['access_key_id'], account['access_key_secret'], account.get('bill_region_id') or DEFAULT_BILL_REGION_ID)
+    bill_region_id = account.get('bill_region_id') or recommended_bill_region_id(account.get('is_international'))
+    return AcsClient(account['access_key_id'], account['access_key_secret'], bill_region_id)
 
 # =========================
 # TG 和通知状态
@@ -905,10 +916,21 @@ def build_account_from_prompt(existing: Optional[Dict[str, Any]] = None) -> Dict
     print(ECS_REGION_HELP)
     acc['region_id'] = prompt('ECS 区域，例如香港 cn-hongkong / 日本 ap-northeast-1', existing.get('region_id', 'cn-hongkong'))
     acc['instance_id'] = prompt('ECS 实例 ID', existing.get('instance_id'))
+    old_is_international = normalize_bool(existing.get('is_international', False))
+    acc['is_international'] = prompt_bool('是否国际版账号', old_is_international)
     print(BILL_REGION_HELP)
-    acc['bill_region_id'] = prompt('账单接口区域，默认 cn-hangzhou', existing.get('bill_region_id', DEFAULT_BILL_REGION_ID))
+    recommended_bill = recommended_bill_region_id(acc['is_international'])
+    old_recommended_bill = recommended_bill_region_id(old_is_international)
+    existing_bill = existing.get('bill_region_id')
+    if existing_bill and not (old_is_international != acc['is_international'] and existing_bill == old_recommended_bill):
+        bill_default = existing_bill
+    else:
+        bill_default = recommended_bill
+    bill_prompt = (
+        f'账单接口区域，{"国际版" if acc["is_international"] else "国内版"}默认 {recommended_bill}'
+    )
+    acc['bill_region_id'] = prompt(bill_prompt, bill_default)
     acc['max_traffic_gb'] = safe_float(prompt('流量阈值 GB', str(existing.get('max_traffic_gb', DEFAULT_MAX_TRAFFIC_GB))))
-    acc['is_international'] = prompt_bool('是否国际版账号', normalize_bool(existing.get('is_international', False)))
     report_default = existing.get('daily_report_time', DEFAULT_DAILY_REPORT_TIME)
     report_time = prompt('每天日报推送时间 HH:MM，固定按北京时间 UTC+8', report_default)
     if not re.match(r'^([01][0-9]|2[0-3]):[0-5][0-9]$', report_time):

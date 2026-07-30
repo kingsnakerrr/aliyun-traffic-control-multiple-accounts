@@ -28,17 +28,20 @@ echo "常见 ECS 区域：香港 cn-hongkong，日本东京 ap-northeast-1，新
 echo "注意：ECS 区域必须填实例真实所在地域。香港填 cn-hongkong，日本东京填 ap-northeast-1。"
 read -r -p "ECS 区域，默认 cn-hongkong: " REGION_ID
 REGION_ID=${REGION_ID:-cn-hongkong}
-echo "账单接口区域一般保持 cn-hangzhou，和 ECS 所在地域不是同一个概念。"
-read -r -p "账单接口区域，默认 cn-hangzhou: " BILL_REG_ID
-BILL_REG_ID=${BILL_REG_ID:-cn-hangzhou}
-read -r -p "流量阈值GB，默认 180: " MAX_TRAFFIC_GB
-MAX_TRAFFIC_GB=${MAX_TRAFFIC_GB:-180}
 read -r -p "是否国际版账号？输入 y 表示国际版，默认国内版: " INTL
 if [ "$INTL" = "y" ] || [ "$INTL" = "Y" ]; then
   IS_INTERNATIONAL="true"
+  BILL_REG_DEFAULT="ap-southeast-1"
+  echo "账单接口区域不是 ECS 区域。国际版账号一般填 ap-southeast-1。"
 else
   IS_INTERNATIONAL="false"
+  BILL_REG_DEFAULT="cn-hangzhou"
+  echo "账单接口区域不是 ECS 区域。国内版账号一般填 cn-hangzhou。"
 fi
+read -r -p "账单接口区域，默认 ${BILL_REG_DEFAULT}: " BILL_REG_ID
+BILL_REG_ID=${BILL_REG_ID:-$BILL_REG_DEFAULT}
+read -r -p "流量阈值GB，默认 180: " MAX_TRAFFIC_GB
+MAX_TRAFFIC_GB=${MAX_TRAFFIC_GB:-180}
 read -r -p "每天日报推送时间，24小时制 HH:MM，默认 09:00。固定按北京时间 UTC+8 发送: " REPORT_TIME
 REPORT_TIME=${REPORT_TIME:-09:00}
 if ! echo "$REPORT_TIME" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$'; then
