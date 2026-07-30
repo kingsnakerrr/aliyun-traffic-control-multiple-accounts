@@ -61,6 +61,7 @@ cdt
 a. 增加账号
 d. 删除账号
 t. TG Bot / 日志
+x. 一键升级程序
 u. 完全卸载程序
 0. 退出
 ```
@@ -83,6 +84,14 @@ u. 完全卸载程序
 ```
 
 `t. TG Bot / 日志` 用于查看/修改 Telegram 配置、发送测试消息、启停/重启 Bot 服务、查看日志、查看 crontab、备份或手动编辑配置。
+
+`x. 一键升级程序` 会更新主程序、`cdt` 菜单和 systemd service，保留 `accounts.json`、Telegram 配置、通知状态、日志和 venv。旧机器如果菜单里还没有 `x`，先执行一次：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/main/cdt -o /usr/local/bin/cdt && chmod +x /usr/local/bin/cdt
+```
+
+之后运行 `cdt`，选择 `x. 一键升级程序` 即可。
 
 ## 状态显示
 

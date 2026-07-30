@@ -6,6 +6,7 @@ SERVICE_NAME="traffic-control.service"
 PY="${BASE_DIR}/venv/bin/python"
 APP="${BASE_DIR}/traffic_control.py"
 ACCOUNTS_FILE="${BASE_DIR}/accounts.json"
+REPO_RAW="https://raw.githubusercontent.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/main"
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "请使用 root 用户运行"; exit 1; }; }
 pause(){ echo; read -r -p "按回车返回菜单..."; }
@@ -28,6 +29,101 @@ edit_accounts_json(){ ${EDITOR:-nano} "$ACCOUNTS_FILE"; echo "修改完成后建
 edit_config(){ ${EDITOR:-nano} "$APP"; echo "修改完成后建议重启服务：systemctl restart traffic-control"; }
 backup_accounts(){ cp -a "$ACCOUNTS_FILE" "${ACCOUNTS_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true; echo "已备份 accounts.json 到同目录 .bak 文件"; }
 account_count(){ run_app --account-count 2>/dev/null || echo 0; }
+
+upgrade_program(){
+  echo "一键升级会更新主程序、cdt 菜单和 systemd service。"
+  echo "不会覆盖 accounts.json、通知状态、日志或 venv。"
+  read -r -p "确定升级？输入 yes 继续: " ans
+  [ "$ans" = "yes" ] || { echo "已取消升级"; return; }
+
+  local ts tmp_tpl tmp_cdt tmp_service py_bin
+  ts="$(date +%Y%m%d%H%M%S)"
+  tmp_tpl="$(mktemp)"
+  tmp_cdt="$(mktemp)"
+  tmp_service="$(mktemp)"
+  cleanup_upgrade_tmp(){ rm -f "$tmp_tpl" "$tmp_cdt" "$tmp_service"; }
+
+  echo "正在下载最新版文件..."
+  if ! curl -fsSL "${REPO_RAW}/traffic_control.py.template" -o "$tmp_tpl"; then
+    echo "下载 traffic_control.py.template 失败，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+  if ! curl -fsSL "${REPO_RAW}/cdt" -o "$tmp_cdt"; then
+    echo "下载 cdt 失败，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+  if ! curl -fsSL "${REPO_RAW}/traffic-control.service" -o "$tmp_service"; then
+    echo "下载 traffic-control.service 失败，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+
+  py_bin="$PY"
+  if [ ! -x "$py_bin" ]; then
+    py_bin="$(command -v python3 || true)"
+  fi
+  if [ -z "$py_bin" ] || [ ! -x "$py_bin" ]; then
+    echo "没有找到可用 Python，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+  if [ ! -f "$APP" ]; then
+    echo "没有找到主程序 $APP，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+
+  cp -a "$APP" "${APP}.bak.${ts}" 2>/dev/null || true
+  cp -a "/usr/local/bin/cdt" "/usr/local/bin/cdt.bak.${ts}" 2>/dev/null || true
+  cp -a "/etc/systemd/system/${SERVICE_NAME}" "/etc/systemd/system/${SERVICE_NAME}.bak.${ts}" 2>/dev/null || true
+
+  if ! "$py_bin" - "$tmp_tpl" "$APP" <<'PYUP'
+from pathlib import Path
+import re
+import sys
+
+tpl_path = Path(sys.argv[1])
+app_path = Path(sys.argv[2])
+tpl = tpl_path.read_text(encoding='utf-8')
+old = app_path.read_text(encoding='utf-8')
+
+def get(name):
+    m = re.search(rf"^{name}\s*=\s*(['\"])(.*?)\1", old, re.M)
+    if not m:
+        raise SystemExit(f'没有找到 {name}，无法保留 Telegram 配置')
+    return m.group(2)
+
+for name, placeholder in {
+    'TELEGRAM_BOT_TOKEN': '__TELEGRAM_BOT_TOKEN__',
+    'TELEGRAM_CHAT_ID': '__TELEGRAM_CHAT_ID__',
+    'ADMIN_USER_ID': '__ADMIN_USER_ID__',
+}.items():
+    tpl = tpl.replace(placeholder, get(name))
+
+app_path.write_text(tpl, encoding='utf-8')
+PYUP
+  then
+    echo "生成新版主程序失败，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+
+  chmod +x "$APP"
+  cp -f "$tmp_cdt" /usr/local/bin/cdt
+  chmod +x /usr/local/bin/cdt
+  cp -f "$tmp_service" "/etc/systemd/system/${SERVICE_NAME}"
+  systemctl daemon-reload || true
+  if ! systemctl restart "$SERVICE_NAME"; then
+    echo "新版文件已写入，但服务重启失败。请运行：systemctl status traffic-control -l --no-pager"
+    cleanup_upgrade_tmp
+    return
+  fi
+  cleanup_upgrade_tmp
+  echo "升级完成，已重启 TG Bot 服务。"
+  echo "备份文件示例：${APP}.bak.${ts}"
+}
 
 
 show_tg_config(){
@@ -237,6 +333,7 @@ main_menu(){
     echo "a. 增加账号"
     echo "d. 删除账号"
     echo "t. TG Bot / 日志"
+    echo "x. 一键升级程序"
     echo "u. 完全卸载程序"
     echo "0. 退出"
     echo "=============================="
@@ -246,6 +343,7 @@ main_menu(){
       a|A) run_app --add-account; restart_bot_quiet; pause;;
       d|D) run_app --delete-account; restart_bot_quiet; pause;;
       t|T) telegram_menu;;
+      x|X) upgrade_program; pause;;
       u|U) uninstall_all;;
       ''|*[!0-9]*) echo "无效选项"; pause;;
       *)
