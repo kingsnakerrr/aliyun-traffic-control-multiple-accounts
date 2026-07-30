@@ -640,6 +640,30 @@ def build_all_status_text() -> str:
     return '\n\n'.join(parts)
 
 
+def send_status_messages_to_tg(chat_id) -> int:
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        send_tg(chat_id, '❌ 暂无账号，请先用 cdt -> 增加账号。')
+        return 0
+    sent = 0
+    for acc in accounts:
+        if send_tg(chat_id, build_status_text(acc)):
+            sent += 1
+    return sent
+
+
+def send_status_messages_to_bot(bot, chat_id) -> int:
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        bot.send_message(chat_id=chat_id, text='❌ 暂无账号，请先用 cdt -> 增加账号。')
+        return 0
+    sent = 0
+    for acc in accounts:
+        bot.send_message(chat_id=chat_id, text=build_status_text(acc))
+        sent += 1
+    return sent
+
+
 def build_help_text() -> str:
     return (
         '🤖 阿里云 CDT 多账号控制机器人命令\n\n'
@@ -1108,7 +1132,7 @@ def help_command(update: Update, context: CallbackContext):
 def status_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-    context.bot.send_message(chat_id=get_chat_id(update), text=build_all_status_text())
+    send_status_messages_to_bot(context.bot, get_chat_id(update))
 
 
 @run_async
@@ -1213,13 +1237,13 @@ def keepoff_command(update: Update, context: CallbackContext):
 def report_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-    send_tg(TELEGRAM_CHAT_ID, build_all_status_text())
-    context.bot.send_message(chat_id=get_chat_id(update), text='✅ 已发送所有账号完整报告到频道。')
+    sent = send_status_messages_to_tg(TELEGRAM_CHAT_ID)
+    context.bot.send_message(chat_id=get_chat_id(update), text=f'✅ 已按账号分别发送 {sent} 条报告到频道。')
 
 
 def send_report_now():
-    send_tg(TELEGRAM_CHAT_ID, build_all_status_text())
-    logging.info('已手动发送所有账号日报到频道。')
+    sent = send_status_messages_to_tg(TELEGRAM_CHAT_ID)
+    logging.info(f'已手动按账号分别发送 {sent} 条日报到频道。')
 
 # =========================
 # 主入口
