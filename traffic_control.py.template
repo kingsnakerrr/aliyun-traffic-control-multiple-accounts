@@ -46,6 +46,12 @@ MONTHLY_RESET_OPEN_MINUTE = 5
 DEFAULT_DAILY_REPORT_TIME = '09:00'
 DEFAULT_MAX_TRAFFIC_GB = 180.0
 DEFAULT_BILL_REGION_ID = 'cn-hangzhou'
+ECS_REGION_HELP = (
+    '常见 ECS 区域：香港 cn-hongkong，日本东京 ap-northeast-1，新加坡 ap-southeast-1，'
+    '美国硅谷 us-west-1，美国弗吉尼亚 us-east-1，杭州 cn-hangzhou，上海 cn-shanghai，'
+    '北京 cn-beijing，深圳 cn-shenzhen。ECS 区域必须填实例真实所在地域。'
+)
+BILL_REGION_HELP = '账单接口区域一般保持 cn-hangzhou，和 ECS 所在地域不是同一个概念。'
 
 # =========================
 # 日志
@@ -486,7 +492,7 @@ def get_cdt_traffic(account: Dict[str, Any]) -> Optional[float]:
         return None
 
 
-def get_aliyun_data(account: Dict[str, Any]) -> str:
+def get_aliyun_data(account: Dict[str, Any], compact: bool = False) -> str:
     try:
         balance = '0.00'
         request_bal = QueryAccountBalanceRequest.QueryAccountBalanceRequest()
@@ -506,11 +512,20 @@ def get_aliyun_data(account: Dict[str, Any]) -> str:
             items = data_bill.get('Data', {}).get('Items', {}).get('Item', [])
             cost = sum(float(item.get('PretaxAmount', 0)) for item in items)
 
+        if compact:
+            if normalize_bool(account.get('is_international')):
+                return f'扣费方式：国际站后付费（本月消费：${cost:.2f}）'
+            return f'账户现金余额：{balance} 元（本月消费：{cost:.2f} 元）'
+
         if normalize_bool(account.get('is_international')):
             return f'💳 扣费方式：国际站后付费\n💵 本月消费（1号至今）：${cost:.2f}'
         return f'💰 账户现金余额：{balance} 元\n💵 本月消费（1号至今）：{cost:.2f} 元'
     except Exception as e:
         logging.error(f'[{account_name(account)}] 查询余额/账单失败: {str(e)}')
+        if compact:
+            if normalize_bool(account.get('is_international')):
+                return '扣费方式：国际站后付费（本月消费：$0.00）'
+            return '账户现金余额：暂无数据（本月消费：0.00 元）'
         if normalize_bool(account.get('is_international')):
             return '💳 扣费方式：国际站后付费\n💵 本月消费（1号至今）：$0.00'
         return '💰 账户现金余额：暂无数据\n💵 本月消费（1号至今）：0.00 元'
@@ -531,6 +546,48 @@ def traffic_with_limit_text(account: Dict[str, Any], traffic: Optional[float]) -
     if traffic is None:
         return f'查询失败 / {max_gb(account):g} GB'
     return f'{traffic} GB / {max_gb(account):g} GB'
+
+
+def traffic_control_badge(account: Dict[str, Any], traffic: Optional[float]) -> str:
+    if traffic is None:
+        return '🟡 查询失败'
+    limit = max_gb(account)
+    if traffic >= limit:
+        return '🔴 超限'
+    if limit > 0 and traffic >= limit * 0.9:
+        return '🟡 接近阈值'
+    return '🟢 正常'
+
+
+def instance_status_badge(status: str) -> str:
+    status_s = str(status or 'Unknown')
+    status_l = status_s.lower()
+    if status_l == 'running':
+        return '🟢 Running'
+    if status_l == 'stopped':
+        return '⚫ Stopped'
+    if status_l == 'starting':
+        return '🟡 Starting'
+    if status_l == 'stopping':
+        return '🟡 Stopping'
+    if status_l == 'unknown':
+        return '🔴 Unknown'
+    return f'🔴 {status_s}'
+
+
+def keepalive_badge(account: Dict[str, Any], instance_status: str) -> str:
+    if not account_keepalive_enabled(account):
+        return '🟡 已暂停'
+    status_l = str(instance_status or 'Unknown').lower()
+    if status_l == 'running':
+        return '🟢 正常'
+    if status_l in ['starting', 'stopping']:
+        return '🟡 等待稳定'
+    if has_notify_key(account, 'traffic_stop'):
+        return '⚫ 熔断停机'
+    if has_notify_key(account, 'manual_stop'):
+        return '⚫ 手动停机'
+    return '🔴 异常'
 
 
 def account_runtime_status(account: Dict[str, Any], instance_status: Optional[str] = None) -> str:
@@ -561,25 +618,17 @@ def account_runtime_status(account: Dict[str, Any], instance_status: Optional[st
 def build_status_text(account: Dict[str, Any]) -> str:
     traffic = get_cdt_traffic(account)
     instance_status = get_vps_status(account)
-    runtime_status = account_runtime_status(account, instance_status)
-    financial_info = get_aliyun_data(account)
-    keep_status = '正常' if account_keepalive_enabled(account) else '已暂停'
-    enabled_text = '启用' if account_enabled(account) else '已禁用'
+    financial_info = get_aliyun_data(account, compact=True)
+    financial_icon = '💳' if normalize_bool(account.get('is_international')) else '💰'
     return (
-        f'📊 阿里云账号 {account_name(account)} - CDT服务器\n\n'
-        '----------------------------------\n'
+        f'📊 {account_name(account)}\n\n'
         f'⏰ 时间：{now_text()}\n'
-        f'📡 当前流量：{traffic_with_limit_text(account, traffic)}\n'
-        f'🖥 实例状态：{instance_status}\n'
-        f'📌 当前状态：{runtime_status}\n'
+        f'📡 当前流量：{traffic_with_limit_text(account, traffic)}（流量控制：{traffic_control_badge(account, traffic)}）\n'
+        f'🖥 实例状态：{instance_status_badge(instance_status)}\n'
+        f'⚡ 保活运行：{keepalive_badge(account, instance_status)}\n'
+        f'{financial_icon} {financial_info}\n'
         f'🌍 ECS区域：{account.get("region_id")}\n'
-        f'🆔 实例：{account.get("instance_id")}\n'
-        f'{financial_info}\n'
-        f'⚡ 保活运行状态：{keep_status}\n'
-        f'🔘 账号状态：{enabled_text}\n'
-        f'📅 下次自动检测开机：{get_next_cdt_reset_check_time()}\n'
-        '✅ 流量控制脚本运行正常\n'
-        '----------------------------------'
+        f'🆔 实例：{account.get("instance_id")}'
     )
 
 
@@ -829,9 +878,11 @@ def build_account_from_prompt(existing: Optional[Dict[str, Any]] = None) -> Dict
     acc['name'] = prompt('账号显示名称，例如 zymsdf-香港', existing.get('name', 'zymsdf'))
     acc['access_key_id'] = prompt('阿里云 ACCESS_KEY_ID', existing.get('access_key_id'))
     acc['access_key_secret'] = prompt('阿里云 ACCESS_KEY_SECRET', existing.get('access_key_secret'))
-    acc['region_id'] = prompt('ECS 区域，例如 cn-hongkong', existing.get('region_id', 'cn-hongkong'))
+    print(ECS_REGION_HELP)
+    acc['region_id'] = prompt('ECS 区域，例如香港 cn-hongkong / 日本 ap-northeast-1', existing.get('region_id', 'cn-hongkong'))
     acc['instance_id'] = prompt('ECS 实例 ID', existing.get('instance_id'))
-    acc['bill_region_id'] = prompt('账单接口区域', existing.get('bill_region_id', DEFAULT_BILL_REGION_ID))
+    print(BILL_REGION_HELP)
+    acc['bill_region_id'] = prompt('账单接口区域，默认 cn-hangzhou', existing.get('bill_region_id', DEFAULT_BILL_REGION_ID))
     acc['max_traffic_gb'] = safe_float(prompt('流量阈值 GB', str(existing.get('max_traffic_gb', DEFAULT_MAX_TRAFFIC_GB))))
     acc['is_international'] = prompt_bool('是否国际版账号', normalize_bool(existing.get('is_international', False)))
     report_default = existing.get('daily_report_time', DEFAULT_DAILY_REPORT_TIME)
@@ -1072,7 +1123,7 @@ def traffic_command(update: Update, context: CallbackContext):
     for i, acc in enumerate(accounts, start=1):
         traffic = get_cdt_traffic(acc)
         enabled = '启用' if account_enabled(acc) else '禁用'
-        lines.append(f'{i}. {account_name(acc)}：{traffic_with_limit_text(acc, traffic)}（{enabled}）')
+        lines.append(f'{i}. {account_name(acc)}：{traffic_with_limit_text(acc, traffic)}（{traffic_control_badge(acc, traffic)}，{enabled}）')
     context.bot.send_message(chat_id=get_chat_id(update), text='\n'.join(lines))
 
 

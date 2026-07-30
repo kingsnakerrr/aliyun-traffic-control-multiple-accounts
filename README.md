@@ -18,6 +18,27 @@ cdt
 
 然后选择 `a. 增加账号`。
 
+## 区域怎么填
+
+新增或编辑账号时有两个区域字段：
+
+- `ECS 区域`：填实例真实所在地域。香港填 `cn-hongkong`，日本东京填 `ap-northeast-1`。
+- `账单接口区域`：一般保持默认 `cn-hangzhou`，它和 ECS 所在地域不是同一个概念。
+
+常见 ECS 区域：
+
+```text
+香港：cn-hongkong
+日本东京：ap-northeast-1
+新加坡：ap-southeast-1
+美国硅谷：us-west-1
+美国弗吉尼亚：us-east-1
+杭州：cn-hangzhou
+上海：cn-shanghai
+北京：cn-beijing
+深圳：cn-shenzhen
+```
+
 ## cdt 菜单
 
 运行：
@@ -62,6 +83,31 @@ u. 完全卸载程序
 ```
 
 `t. TG Bot / 日志` 用于查看/修改 Telegram 配置、发送测试消息、启停/重启 Bot 服务、查看日志、查看 crontab、备份或手动编辑配置。
+
+## 状态显示
+
+账号状态报告使用简约格式，Telegram 和 `cdt` 里的单账号状态一致：
+
+```text
+📊 zymasd-香港
+
+⏰ 时间：2026-07-30 10:20:04 UTC+8
+📡 当前流量：82.17 GB / 180 GB（流量控制：🟢 正常）
+🖥 实例状态：🟢 Running
+⚡ 保活运行：🟢 正常
+💰 账户现金余额：93.11 元（本月消费：5.20 元）
+🌍 ECS区域：cn-hongkong
+🆔 实例：i-xxxxxxxxxxxxxxxxx
+```
+
+状态徽标含义：
+
+```text
+🟢 正常
+🟡 接近阈值 / 查询失败 / 启停中 / 已暂停
+🔴 超限 / 异常 / Unknown
+⚫ Stopped / 熔断停机 / 手动停机
+```
 
 ## Telegram 配置
 

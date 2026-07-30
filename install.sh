@@ -24,8 +24,11 @@ ACCOUNT_NAME=${ACCOUNT_NAME:-zymsdf-香港}
 read -r -p "阿里云 ACCESS_KEY_ID: " ACCESS_KEY_ID
 read -r -p "阿里云 ACCESS_KEY_SECRET: " ACCESS_KEY_SECRET
 read -r -p "ECS 实例 ID: " INSTANCE_ID
+echo "常见 ECS 区域：香港 cn-hongkong，日本东京 ap-northeast-1，新加坡 ap-southeast-1，美国硅谷 us-west-1，美国弗吉尼亚 us-east-1，杭州 cn-hangzhou，上海 cn-shanghai，北京 cn-beijing，深圳 cn-shenzhen。"
+echo "注意：ECS 区域必须填实例真实所在地域。香港填 cn-hongkong，日本东京填 ap-northeast-1。"
 read -r -p "ECS 区域，默认 cn-hongkong: " REGION_ID
 REGION_ID=${REGION_ID:-cn-hongkong}
+echo "账单接口区域一般保持 cn-hangzhou，和 ECS 所在地域不是同一个概念。"
 read -r -p "账单接口区域，默认 cn-hangzhou: " BILL_REG_ID
 BILL_REG_ID=${BILL_REG_ID:-cn-hangzhou}
 read -r -p "流量阈值GB，默认 180: " MAX_TRAFFIC_GB
