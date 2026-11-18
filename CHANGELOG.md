@@ -1,3 +1,9 @@
+## 2026-11-19 CF 配置纠错与权限提示
+
+- 新增 `/cfconfig` 按账号修改域名、区域 ID、API 令牌和只读验证按钮；`/cancel` 可退出输入。
+- 换 IP 前验证 Cloudflare 区域与域名匹配，避免填入账户 ID 后才触发 EIP 操作。
+- 阿里云 `Forbidden.RAM` 查询 EIP 失败时明确提示 RAM 用户所需权限。
+
 ## 2026-11-19 Telegram 换 EIP 与 Cloudflare 解析
 
 - 新增 `/changeip` 单账号或所有启用账号换 EIP，缺少域名/Zone ID/Token 时逐台引导，执行前二次确认。

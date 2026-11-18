@@ -695,6 +695,8 @@ def build_help_text() -> str:
         '/keepon 账号名或序号 - 开启指定账号自动保活\n'
         '/keepoff 账号名或序号 - 暂停指定账号自动保活\n'
         '/changeip - 选择单账号或批量更换 EIP 并更新 Cloudflare\n'
+        '/cfconfig - 修改账号的 Cloudflare 域名、区域 ID 或令牌\n'
+        '/cancel - 取消当前配置输入\n'
         '/help - 查看命令帮助\n\n'
         '说明：\n'
         '1. 机器人只接受管理员私聊命令。\n'
@@ -1172,8 +1174,13 @@ def describe_eip(account: Dict[str, Any], allocation_id: str) -> Optional[Dict[s
 
 
 def current_eip(account: Dict[str, Any]) -> Dict[str, Any]:
-    data = vpc_action(account, 'DescribeEipAddresses', AssociatedInstanceId=account['instance_id'],
-                      AssociatedInstanceType='EcsInstance', PageSize=100)
+    try:
+        data = vpc_action(account, 'DescribeEipAddresses', AssociatedInstanceId=account['instance_id'],
+                          AssociatedInstanceType='EcsInstance', PageSize=100)
+    except Exception as exc:
+        if 'Forbidden.RAM' in str(exc):
+            raise ValueError('阿里云 RAM 用户无权查询 EIP。请在阿里云给该 AccessKey 所属 RAM 用户授予 vpc:DescribeEipAddresses 权限；换 IP 还需 EIP 的申请、解绑、绑定、释放权限。') from exc
+        raise
     items = [e for e in data.get('EipAddresses', {}).get('EipAddress', [])
              if e.get('InstanceId') == account['instance_id'] and e.get('InstanceType') == 'EcsInstance']
     if len(items) != 1:
@@ -1207,8 +1214,11 @@ def wait_eip(account: Dict[str, Any], allocation_id: str, status: str,
 
 def cf_request(account: Dict[str, Any], method: str, path: str, **kwargs) -> Dict[str, Any]:
     zone_id = account['cf_zone_id']
+    url = f'https://api.cloudflare.com/client/v4/zones/{zone_id}'
+    if path:
+        url += f'/{path}'
     response = requests.request(
-        method, f'https://api.cloudflare.com/client/v4/zones/{zone_id}/{path}',
+        method, url,
         headers={'Authorization': f'Bearer {account["cf_api_token"]}'},
         timeout=20, **kwargs
     )
@@ -1242,6 +1252,19 @@ def validate_cf_config(account: Dict[str, Any]):
         raise ValueError('请先设置 Cloudflare API Token。')
 
 
+def verify_cf_zone(account: Dict[str, Any]) -> str:
+    validate_cf_config(account)
+    try:
+        zone = cf_request(account, 'GET', '').get('result') or {}
+    except Exception as exc:
+        raise ValueError(f'无法验证 Cloudflare 区域 ID 和 Token：{exc}。请确认填的是“区域 ID”，不是“账户 ID”。') from exc
+    zone_name = str(zone.get('name') or '').lower().rstrip('.')
+    domain = str(account['cf_domain']).lower().rstrip('.')
+    if not zone_name or not (domain == zone_name or domain.endswith('.' + zone_name)):
+        raise ValueError(f'域名 {domain} 不属于该 Cloudflare 区域 {zone_name or "未知"}，请检查区域 ID 和域名。')
+    return zone_name
+
+
 @contextmanager
 def ip_rotation_lock():
     ensure_base_dir()
@@ -1260,7 +1283,7 @@ def ip_rotation_lock():
 
 
 def rotate_one_eip(account: Dict[str, Any]) -> str:
-    validate_cf_config(account)
+    verify_cf_zone(account)
     old = current_eip(account)
     old_id, old_ip = old['AllocationId'], old['IpAddress']
     record = cf_record(account)
@@ -1344,12 +1367,64 @@ CF_SETUP_PROMPTS = {
     'cf_zone_id': '请输入 Cloudflare Zone ID（32 位，可在域名概览页找到）：',
     'cf_api_token': '请输入具有该 Zone 的 DNS Read/Edit 权限的 Cloudflare API Token。发送后机器人会尽量删除这条消息：',
 }
+CF_FIELD_CODES = {'domain': 'cf_domain', 'zone': 'cf_zone_id', 'token': 'cf_api_token'}
+
+
+def normalize_cf_input(field: str, value: str) -> str:
+    value = value.strip()
+    if field == 'cf_domain':
+        value = value.lower().rstrip('.')
+        if not re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', value) or len(value) > 253:
+            raise ValueError('域名格式不正确，请输入完整域名，例如 abc.222321.xyz。')
+    elif field == 'cf_zone_id' and not re.fullmatch(r'[a-fA-F0-9]{32}', value):
+        raise ValueError('区域 ID 应为 32 位字符串。请复制域名概览页的“区域 ID”，不要填“账户 ID”。')
+    elif field == 'cf_api_token' and (not value or len(value) > 512):
+        raise ValueError('API 令牌为空或过长，请重新输入。')
+    return value
+
+
+def save_cf_setting(account: Dict[str, Any], field: str, value: str):
+    accounts = load_accounts(include_disabled=True)
+    for item in accounts:
+        if account_key(item) == account_key(account):
+            item[field] = value
+            save_accounts(accounts)
+            return
+    raise ValueError('账号已变化，请重新选择。')
+
+
+def cf_config_keyboard(accounts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(account_name(acc), callback_data=f'ip:config:{i}')]
+            for i, acc in enumerate(accounts)]
+    rows.append([InlineKeyboardButton('取消', callback_data='ip:cancel')])
+    return InlineKeyboardMarkup(rows)
+
+
+def show_cf_config_panel(context: CallbackContext, chat_id, index: int):
+    accounts = load_accounts(include_disabled=True)
+    if not 0 <= index < len(accounts):
+        context.bot.send_message(chat_id=chat_id, text='账号列表已变化，请重新发送 /cfconfig。')
+        return
+    account = accounts[index]
+    context.bot.send_message(chat_id=chat_id, text=(
+        f'账号：{account_name(account)}\n'
+        f'域名：{account.get("cf_domain") or "未设置"}\n'
+        f'区域 ID：{account.get("cf_zone_id") or "未设置"}\n'
+        f'API 令牌：{"已设置" if account.get("cf_api_token") else "未设置"}'
+    ), reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton('修改域名', callback_data=f'ip:field:{index}:domain'),
+         InlineKeyboardButton('修改区域 ID', callback_data=f'ip:field:{index}:zone')],
+        [InlineKeyboardButton('更换 API 令牌', callback_data=f'ip:field:{index}:token'),
+         InlineKeyboardButton('验证配置', callback_data=f'ip:verify:{index}')],
+        [InlineKeyboardButton('返回账号列表', callback_data='ip:configlist')]
+    ]))
 
 
 def ip_choice_keyboard(accounts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton('一键更换所有启用账号', callback_data='ip:all')]]
     rows.extend([[InlineKeyboardButton(account_name(acc), callback_data=f'ip:one:{i}')]
                  for i, acc in enumerate(accounts)])
+    rows.append([InlineKeyboardButton('修改 Cloudflare 配置', callback_data='ip:configlist')])
     rows.append([InlineKeyboardButton('取消', callback_data='ip:cancel')])
     return InlineKeyboardMarkup(rows)
 
@@ -1372,6 +1447,24 @@ def prompt_ip_setup(context: CallbackContext, chat_id):
             return
         state['index'] += 1
     context.user_data.pop('ip_setup', None)
+    for key in keys:
+        account = find_account(key, include_disabled=True)
+        if not account:
+            continue
+        try:
+            verify_cf_zone(account)
+        except Exception as exc:
+            context.user_data.pop('ip_targets', None)
+            accounts = load_accounts(include_disabled=True)
+            index = next((i for i, item in enumerate(accounts) if account_key(item) == key), None)
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton('修改这个账号的 CF 配置', callback_data=f'ip:config:{index}')
+            ]]) if index is not None else None
+            context.bot.send_message(chat_id=chat_id, text=(
+                f'{account_name(account)} 的 Cloudflare 配置校验失败：{exc}\n'
+                '尚未申请或更换 EIP。请修改后重新发送 /changeip。'
+            ), reply_markup=markup)
+            return
     names = [account_name(find_account(key, include_disabled=True)) for key in keys
              if find_account(key, include_disabled=True)]
     context.bot.send_message(chat_id=chat_id, text=(
@@ -1393,7 +1486,32 @@ def changeip_command(update: Update, context: CallbackContext):
         return
     context.user_data.pop('ip_setup', None)
     context.user_data.pop('ip_targets', None)
+    context.user_data.pop('ip_edit', None)
     update.message.reply_text('选择要更换 EIP 的账号：', reply_markup=ip_choice_keyboard(accounts))
+
+
+@run_async
+def cfconfig_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        update.message.reply_text('暂无账号。')
+        return
+    context.user_data.pop('ip_setup', None)
+    context.user_data.pop('ip_targets', None)
+    context.user_data.pop('ip_edit', None)
+    update.message.reply_text('选择要修改 Cloudflare 配置的账号：',
+                              reply_markup=cf_config_keyboard(accounts))
+
+
+@run_async
+def cancel_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    for key in ('ip_setup', 'ip_targets', 'ip_edit'):
+        context.user_data.pop(key, None)
+    update.message.reply_text('已取消当前操作。')
 
 
 @run_async
@@ -1406,7 +1524,50 @@ def ip_callback(update: Update, context: CallbackContext):
     if action == 'ip:cancel':
         context.user_data.pop('ip_setup', None)
         context.user_data.pop('ip_targets', None)
+        context.user_data.pop('ip_edit', None)
         query.message.reply_text('已取消换 IP。')
+        return
+    if action == 'ip:configlist':
+        context.user_data.pop('ip_setup', None)
+        context.user_data.pop('ip_targets', None)
+        context.user_data.pop('ip_edit', None)
+        accounts = load_accounts(include_disabled=True)
+        query.message.reply_text('选择要修改 Cloudflare 配置的账号：',
+                                 reply_markup=cf_config_keyboard(accounts))
+        return
+    if action.startswith('ip:config:') and action[10:].isdigit():
+        context.user_data.pop('ip_setup', None)
+        context.user_data.pop('ip_targets', None)
+        context.user_data.pop('ip_edit', None)
+        show_cf_config_panel(context, query.message.chat_id, int(action[10:]))
+        return
+    if action.startswith('ip:field:'):
+        parts = action.split(':')
+        if len(parts) == 4 and parts[2].isdigit() and parts[3] in CF_FIELD_CODES:
+            accounts = load_accounts(include_disabled=True)
+            index = int(parts[2])
+            if 0 <= index < len(accounts):
+                field = CF_FIELD_CODES[parts[3]]
+                context.user_data.pop('ip_setup', None)
+                context.user_data.pop('ip_targets', None)
+                context.user_data['ip_edit'] = {'key': account_key(accounts[index]), 'field': field}
+                query.message.reply_text(f'账号：{account_name(accounts[index])}\n{CF_SETUP_PROMPTS[field]}\n发送 /cancel 可取消。')
+                return
+        query.message.reply_text('账号列表已变化，请重新发送 /cfconfig。')
+        return
+    if action.startswith('ip:verify:') and action[10:].isdigit():
+        accounts = load_accounts(include_disabled=True)
+        index = int(action[10:])
+        if not 0 <= index < len(accounts):
+            query.message.reply_text('账号列表已变化，请重新发送 /cfconfig。')
+            return
+        account = accounts[index]
+        try:
+            zone = verify_cf_zone(account)
+            cf_record(account)
+            query.message.reply_text(f'✅ {account_name(account)}：Cloudflare 区域 {zone}、令牌和 DNS 读取均正常。未执行换 IP。')
+        except Exception as exc:
+            query.message.reply_text(f'❌ {account_name(account)}：{exc}\n未执行换 IP，可点上方按钮修改配置。')
         return
     if action == 'ip:confirm':
         keys = context.user_data.pop('ip_targets', None)
@@ -1462,6 +1623,39 @@ def ip_callback(update: Update, context: CallbackContext):
 def ip_setup_message(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
+    edit = context.user_data.get('ip_edit')
+    if edit:
+        account = find_account(edit['key'], include_disabled=True)
+        if not account:
+            context.user_data.pop('ip_edit', None)
+            update.message.reply_text('账号已变化，请重新发送 /cfconfig。')
+            return
+        field = edit['field']
+        if field == 'cf_api_token':
+            try:
+                update.message.delete()
+            except Exception:
+                update.message.reply_text('无法删除含令牌的消息，请手动删除并考虑更换令牌。')
+        try:
+            value = normalize_cf_input(field, update.message.text)
+            save_cf_setting(account, field, value)
+        except ValueError as exc:
+            update.message.reply_text(f'{exc}\n请重新输入，或发送 /cancel 取消。')
+            return
+        context.user_data.pop('ip_edit', None)
+        account = find_account(edit['key'], include_disabled=True)
+        try:
+            zone = verify_cf_zone(account)
+            result = f'✅ 已保存，Cloudflare 区域 {zone} 与域名匹配。'
+        except Exception as exc:
+            result = f'已保存，但 Cloudflare 配置还未通过校验：{exc}'
+        update.message.reply_text(result + '\n此操作没有更换 IP。')
+        accounts = load_accounts(include_disabled=True)
+        index = next((i for i, item in enumerate(accounts)
+                      if account_key(item) == edit['key']), None)
+        if index is not None:
+            show_cf_config_panel(context, update.effective_chat.id, index)
+        return
     state = context.user_data.get('ip_setup')
     if not state:
         return
@@ -1477,23 +1671,12 @@ def ip_setup_message(update: Update, context: CallbackContext):
             update.message.delete()
         except Exception:
             update.message.reply_text('无法删除包含 Token 的消息，请手动删除并考虑更换 Token。')
-    if field == 'cf_domain':
-        value = value.lower().rstrip('.')
-        if not re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', value) or len(value) > 253:
-            update.message.reply_text('域名格式不正确，请重新输入完整域名。')
-            return
-    elif field == 'cf_zone_id' and not re.fullmatch(r'[a-fA-F0-9]{32}', value):
-        update.message.reply_text('Zone ID 应为 32 位十六进制字符串，请重新输入。')
+    try:
+        value = normalize_cf_input(field, value)
+        save_cf_setting(account, field, value)
+    except ValueError as exc:
+        update.message.reply_text(f'{exc}\n请重新输入，或发送 /cancel 取消。')
         return
-    elif field == 'cf_api_token' and (not value or len(value) > 512):
-        update.message.reply_text('Token 为空或过长，请重新输入。')
-        return
-    accounts = load_accounts(include_disabled=True)
-    for item in accounts:
-        if account_key(item) == account_key(account):
-            item[field] = value
-            break
-    save_accounts(accounts)
     prompt_ip_setup(context, update.effective_chat.id)
 
 
@@ -1633,6 +1816,8 @@ def register_bot_menu():
         {'command': 'keepon', 'description': '开启指定账号保活'},
         {'command': 'keepoff', 'description': '关闭指定账号保活'},
         {'command': 'changeip', 'description': '选择账号更换 EIP 并更新 CF'},
+        {'command': 'cfconfig', 'description': '修改并验证 Cloudflare 配置'},
+        {'command': 'cancel', 'description': '取消当前配置输入'},
         {'command': 'help', 'description': '查看命令说明'},
     ]
     base = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
@@ -1741,6 +1926,8 @@ def main():
     dispatcher.add_handler(CommandHandler('keepoff', keepoff_command))
     dispatcher.add_handler(CommandHandler('report', report_command))
     dispatcher.add_handler(CommandHandler('changeip', changeip_command))
+    dispatcher.add_handler(CommandHandler('cfconfig', cfconfig_command))
+    dispatcher.add_handler(CommandHandler('cancel', cancel_command))
     dispatcher.add_handler(CallbackQueryHandler(ip_callback, pattern=r'^ip:'))
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, ip_setup_message))
 

@@ -148,10 +148,14 @@ Bot 命令：
 /keepon 账号名或序号
 /keepoff 账号名或序号
 /changeip
+/cfconfig
+/cancel
 /help
 ```
 
 机器人启动时会刷新 Telegram 左下角命令菜单。`/changeip` 可选单个账号或所有启用账号，缺少 Cloudflare 配置时会逐台询问完整域名、Zone ID 和 API Token，最后二次确认。Token 消息会尝试删除，但 Telegram 平台仍可能留有记录，建议使用仅限目标 Zone 的 DNS Read/Edit 权限 Token，不要使用 Global API Key。
+
+填错配置时发送 `/cfconfig`，选择账号后可单独修改域名、区域 ID（Zone ID）或 API 令牌；“验证配置”只读检查区域和 DNS，不会换 IP。输入过程中发送 `/cancel` 可退出。换 IP 前也会先确认区域 ID 对应的区域包含该账号域名，避免把账户 ID 误当成区域 ID。
 
 换 IP 仅支持直绑 ECS、未加入共享带宽的按量付费 EIP。固定公网 IP、辅助网卡 EIP、包年包月 EIP 暂不支持，机器人会拒绝操作。每台账号对应一个域名和一个 Zone ID，配置保存在权限为 `0600` 的 `accounts.json` 中；`cdt` 的“查看 accounts.json”会隐藏密钥。
 
