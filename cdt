@@ -24,7 +24,24 @@ live_logs(){ echo "实时日志：Ctrl+C 退出"; touch "${BASE_DIR}/cron_run.lo
 show_crontab(){ echo "===== 当前 root crontab ====="; crontab -l 2>/dev/null || echo "当前没有 crontab"; }
 show_time(){ echo "===== 当前系统时间 ====="; date; echo; timedatectl 2>/dev/null || true; echo; echo "说明：程序内部日报和月初恢复固定使用 UTC+8 / 北京时间。"; }
 show_notify_state(){ echo "===== 通知状态文件 ====="; cat "${BASE_DIR}/last_notify_state.json" 2>/dev/null || echo "暂无通知状态文件"; }
-show_accounts_json(){ echo "===== accounts.json ====="; cat "$ACCOUNTS_FILE" 2>/dev/null || echo "暂无账号配置"; }
+show_accounts_json(){
+  echo "===== accounts.json（密钥已隐藏）====="
+  "$PY" - "$ACCOUNTS_FILE" <<'PYMASK'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        data = json.load(f)
+    accounts = data.get('accounts', []) if isinstance(data, dict) else data
+    for account in accounts:
+        for key in ('access_key_id', 'access_key_secret', 'cf_api_token'):
+            if account.get(key):
+                account[key] = '***'
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+except (OSError, ValueError) as exc:
+    print(f'读取配置失败：{exc}')
+PYMASK
+}
 edit_accounts_json(){ ${EDITOR:-nano} "$ACCOUNTS_FILE"; echo "修改完成后建议重启服务：systemctl restart traffic-control"; }
 edit_config(){ ${EDITOR:-nano} "$APP"; echo "修改完成后建议重启服务：systemctl restart traffic-control"; }
 backup_accounts(){ cp -a "$ACCOUNTS_FILE" "${ACCOUNTS_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true; echo "已备份 accounts.json 到同目录 .bak 文件"; }
@@ -106,6 +123,13 @@ app_path.write_text(tpl, encoding='utf-8')
 PYUP
   then
     echo "生成新版主程序失败，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+
+  if ! "$py_bin" -m py_compile "$APP"; then
+    cp -f "${APP}.bak.${ts}" "$APP"
+    echo "新版主程序语法检查失败，已恢复旧版。"
     cleanup_upgrade_tmp
     return
   fi

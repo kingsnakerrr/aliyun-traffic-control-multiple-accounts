@@ -147,8 +147,17 @@ Bot 命令：
 /stopvps 账号名或序号
 /keepon 账号名或序号
 /keepoff 账号名或序号
+/changeip
 /help
 ```
+
+机器人启动时会刷新 Telegram 左下角命令菜单。`/changeip` 可选单个账号或所有启用账号，缺少 Cloudflare 配置时会逐台询问完整域名、Zone ID 和 API Token，最后二次确认。Token 消息会尝试删除，但 Telegram 平台仍可能留有记录，建议使用仅限目标 Zone 的 DNS Read/Edit 权限 Token，不要使用 Global API Key。
+
+换 IP 仅支持直绑 ECS、未加入共享带宽的按量付费 EIP。固定公网 IP、辅助网卡 EIP、包年包月 EIP 暂不支持，机器人会拒绝操作。每台账号对应一个域名和一个 Zone ID，配置保存在权限为 `0600` 的 `accounts.json` 中；`cdt` 的“查看 accounts.json”会隐藏密钥。
+
+操作顺序：校验旧 EIP 与 CF A 记录（若无 A 记录，会先创建指向旧 IP 的 DNS-only 记录）→ 申请同地域、同带宽和计费方式的新 EIP → 解绑旧 EIP → 绑定并确认新 EIP → 更新并回读 CF A 记录 → 释放旧 EIP。阿里云不允许同一 ECS 主网卡同时绑定两个 EIP，因此解绑到绑定之间会短暂断网。新 EIP 可能产生费用；如中途失败，机器人会报告保留的 EIP ID 和需要人工核查的状态，不会在 CF 更新失败时释放旧 EIP。Cloudflare 代理设置对已有记录保持不变。
+
+阿里云 AccessKey 除原有 ECS/CDT/账单权限外，还需 `vpc:DescribeEipAddresses`、`vpc:AllocateEipAddress`、`vpc:UnassociateEipAddress`、`vpc:AssociateEipAddress`、`vpc:ReleaseEipAddress`。Cloudflare Token 需要对应 Zone 的 DNS Read/Edit 权限。若账号 AccessKey 无效，换 IP 会失败，需先修正该账号密钥。
 
 ## 安全逻辑
 
@@ -167,6 +176,8 @@ accounts.json
 traffic_control.py
 last_notify_state.json
 last_notify_state.lock
+ip_rotation.lock
+.accounts-*
 keepalive_enabled.flag
 cron_run.log
 *.log

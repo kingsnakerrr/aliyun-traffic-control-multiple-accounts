@@ -7,6 +7,8 @@ import json
 import re
 import tempfile
 import logging
+import ipaddress
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
@@ -24,8 +26,8 @@ from aliyunsdkbssopenapi.request.v20171214 import QueryAccountBalanceRequest
 from aliyunsdkecs.request.v20140526 import StartInstanceRequest
 from aliyunsdkecs.request.v20140526 import StopInstanceRequest
 from aliyunsdkecs.request.v20140526 import DescribeInstancesRequest
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, Filters
 from telegram.ext.dispatcher import run_async
 
 # =========================
@@ -40,6 +42,7 @@ ACCOUNTS_FILE = os.path.join(BASE_DIR, 'accounts.json')
 KEEPALIVE_FLAG_FILE = os.path.join(BASE_DIR, 'keepalive_enabled.flag')
 LAST_NOTIFY_FILE = os.path.join(BASE_DIR, 'last_notify_state.json')
 NOTIFY_LOCK_FILE = os.path.join(BASE_DIR, 'last_notify_state.lock')
+IP_ROTATION_LOCK_FILE = os.path.join(BASE_DIR, 'ip_rotation.lock')
 
 MONTHLY_RESET_OPEN_HOUR = 0
 MONTHLY_RESET_OPEN_MINUTE = 5
@@ -197,12 +200,17 @@ def load_accounts(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def save_accounts(accounts: List[Dict[str, Any]]):
     ensure_base_dir()
-    with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(accounts, f, ensure_ascii=False, indent=2)
+    fd, tmp = tempfile.mkstemp(prefix='.accounts-', dir=BASE_DIR)
     try:
-        os.chmod(ACCOUNTS_FILE, 0o600)
-    except Exception:
-        pass
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(accounts, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ACCOUNTS_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def find_account(selector: Optional[str], include_disabled: bool = False) -> Optional[Dict[str, Any]]:
@@ -266,7 +274,7 @@ def send_tg(chat_id, text, parse_mode=None):
 
 def is_admin(update: Update):
     user_id = update.effective_user.id if update.effective_user else None
-    return str(user_id) == str(ADMIN_USER_ID)
+    return str(user_id) == str(ADMIN_USER_ID) and bool(update.effective_chat and update.effective_chat.type == 'private')
 
 
 def get_chat_id(update: Update):
@@ -686,6 +694,7 @@ def build_help_text() -> str:
         '/stopvps 账号名或序号 - 给指定账号关机，不填则默认第1个\n'
         '/keepon 账号名或序号 - 开启指定账号自动保活\n'
         '/keepoff 账号名或序号 - 暂停指定账号自动保活\n'
+        '/changeip - 选择单账号或批量更换 EIP 并更新 Cloudflare\n'
         '/help - 查看命令帮助\n\n'
         '说明：\n'
         '1. 机器人只接受管理员私聊命令。\n'
@@ -1143,6 +1152,351 @@ def selector_from_args(context: CallbackContext) -> Optional[str]:
     return None
 
 
+def vpc_action(account: Dict[str, Any], action: str, **params) -> Dict[str, Any]:
+    request = CommonRequest()
+    request.set_domain('vpc.aliyuncs.com')
+    request.set_version('2016-04-28')
+    request.set_action_name(action)
+    request.set_method('POST')
+    request.add_query_param('RegionId', account['region_id'])
+    for key, value in params.items():
+        request.add_query_param(key, str(value))
+    response = ecs_client(account).do_action_with_exception(request)
+    return json.loads(response.decode('utf-8'))
+
+
+def describe_eip(account: Dict[str, Any], allocation_id: str) -> Optional[Dict[str, Any]]:
+    data = vpc_action(account, 'DescribeEipAddresses', AllocationId=allocation_id)
+    items = data.get('EipAddresses', {}).get('EipAddress', [])
+    return items[0] if items else None
+
+
+def current_eip(account: Dict[str, Any]) -> Dict[str, Any]:
+    data = vpc_action(account, 'DescribeEipAddresses', AssociatedInstanceId=account['instance_id'],
+                      AssociatedInstanceType='EcsInstance', PageSize=100)
+    items = [e for e in data.get('EipAddresses', {}).get('EipAddress', [])
+             if e.get('InstanceId') == account['instance_id'] and e.get('InstanceType') == 'EcsInstance']
+    if len(items) != 1:
+        raise ValueError('未找到唯一的直绑 ECS EIP。固定公网 IP、辅助网卡 EIP 暂不支持自动更换。')
+    eip = items[0]
+    if (eip.get('Status') != 'InUse' or eip.get('ChargeType') != 'PostPaid' or
+            eip.get('BandwidthPackageId') or eip.get('DeletionProtection') or
+            eip.get('PublicIpAddressPoolId') or eip.get('SegmentInstanceId') or
+            eip.get('BizType', 'Default') != 'Default' or
+            eip.get('BusinessStatus', 'Normal') != 'Normal' or
+            eip.get('Mode', 'NAT') != 'NAT' or
+            eip.get('ISP') not in ('BGP', 'BGP_PRO') or
+            eip.get('InternetChargeType') not in ('PayByTraffic', 'PayByBandwidth') or
+            (eip.get('SecurityProtectionTypes') or {}).get('SecurityProtectionType')):
+        raise ValueError('当前 EIP 状态或计费配置不适合自动更换（仅支持未加入共享带宽的普通按量 EIP）。')
+    if int(eip.get('Bandwidth') or 0) < 1:
+        raise ValueError('无法读取旧 EIP 带宽，已停止。')
+    return eip
+
+
+def wait_eip(account: Dict[str, Any], allocation_id: str, status: str,
+             instance_id: Optional[str] = None) -> Dict[str, Any]:
+    for _ in range(24):
+        eip = describe_eip(account, allocation_id)
+        if eip and eip.get('Status') == status and (
+                instance_id is None or eip.get('InstanceId') == instance_id):
+            return eip
+        time.sleep(5)
+    raise TimeoutError(f'EIP {allocation_id} 未在 120 秒内进入 {status}，请到阿里云控制台检查。')
+
+
+def cf_request(account: Dict[str, Any], method: str, path: str, **kwargs) -> Dict[str, Any]:
+    zone_id = account['cf_zone_id']
+    response = requests.request(
+        method, f'https://api.cloudflare.com/client/v4/zones/{zone_id}/{path}',
+        headers={'Authorization': f'Bearer {account["cf_api_token"]}'},
+        timeout=20, **kwargs
+    )
+    data = response.json()
+    if not response.ok or not data.get('success'):
+        errors = ', '.join(str(e.get('message', '未知错误')) for e in data.get('errors', []))
+        raise ValueError(f'Cloudflare API 失败：{errors or response.status_code}')
+    return data
+
+
+def cf_record(account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    domain = account['cf_domain'].lower().rstrip('.')
+    data = cf_request(account, 'GET', 'dns_records', params={
+        'type': 'A', 'name.exact': domain, 'per_page': 100
+    })
+    records = [r for r in data.get('result', [])
+               if r.get('type') == 'A' and r.get('name', '').lower().rstrip('.') == domain]
+    if len(records) > 1:
+        raise ValueError(f'{domain} 有多个 A 记录，无法安全确认要更新哪一个。')
+    return records[0] if records else None
+
+
+def validate_cf_config(account: Dict[str, Any]):
+    domain = str(account.get('cf_domain') or '').lower().rstrip('.')
+    zone_id = str(account.get('cf_zone_id') or '')
+    if not re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', domain) or len(domain) > 253:
+        raise ValueError('Cloudflare 域名格式不正确。')
+    if not re.fullmatch(r'[a-fA-F0-9]{32}', zone_id):
+        raise ValueError('Cloudflare Zone ID 应为 32 位十六进制字符串。')
+    if not str(account.get('cf_api_token') or '').strip():
+        raise ValueError('请先设置 Cloudflare API Token。')
+
+
+@contextmanager
+def ip_rotation_lock():
+    ensure_base_dir()
+    with open(IP_ROTATION_LOCK_FILE, 'a', encoding='utf-8') as lock_file:
+        os.chmod(IP_ROTATION_LOCK_FILE, 0o600)
+        if fcntl:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('已有换 IP 任务正在执行，请等待完成。')
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def rotate_one_eip(account: Dict[str, Any]) -> str:
+    validate_cf_config(account)
+    old = current_eip(account)
+    old_id, old_ip = old['AllocationId'], old['IpAddress']
+    record = cf_record(account)
+    if record and record.get('content') != old_ip:
+        raise ValueError(f'{account["cf_domain"]} 当前解析与旧 EIP {old_ip} 不一致，已停止以防改错记录。')
+    if not record:
+        data = cf_request(account, 'POST', 'dns_records', json={
+            'type': 'A', 'name': account['cf_domain'], 'content': old_ip,
+            'ttl': 120, 'proxied': False
+        })
+        record = data['result']
+    new_id = None
+    phase = 'preflight'
+    try:
+        allocated = vpc_action(account, 'AllocateEipAddress',
+                               Bandwidth=old['Bandwidth'], ISP=old['ISP'],
+                               InstanceChargeType='PostPaid',
+                               InternetChargeType=old['InternetChargeType'],
+                               **({'ResourceGroupId': old['ResourceGroupId']}
+                                  if old.get('ResourceGroupId') else {}))
+        new_id = allocated['AllocationId']
+        phase = 'allocated'
+        new_ip = allocated['EipAddress']
+        ipaddress.IPv4Address(new_ip)
+        wait_eip(account, new_id, 'Available')
+        phase = 'unbinding'
+        vpc_action(account, 'UnassociateEipAddress', AllocationId=old_id, InstanceId=account['instance_id'])
+        wait_eip(account, old_id, 'Available')
+        phase = 'unbound'
+        phase = 'binding'
+        vpc_action(account, 'AssociateEipAddress', AllocationId=new_id,
+                   InstanceId=account['instance_id'], InstanceType='EcsInstance')
+        wait_eip(account, new_id, 'InUse', account['instance_id'])
+        phase = 'bound'
+        cf_request(account, 'PATCH', f'dns_records/{record["id"]}', json={'content': new_ip})
+        phase = 'dns_updated'
+        if cf_record(account).get('content') != new_ip:
+            raise ValueError('Cloudflare 更新后回读的 IP 不一致。')
+        vpc_action(account, 'ReleaseEipAddress', AllocationId=old_id)
+        return f'✅ {account_name(account)}：{old_ip} → {new_ip}\nCF：{account["cf_domain"]} 已更新，旧 EIP 已释放。'
+    except Exception as exc:
+        detail = str(exc)
+        recovered = False
+        if phase == 'binding':
+            try:
+                new_state = describe_eip(account, new_id)
+                if new_state and new_state.get('Status') == 'InUse' and new_state.get('InstanceId') == account['instance_id']:
+                    phase = 'bound'
+                elif new_state and new_state.get('Status') == 'Available':
+                    phase = 'unbound'
+            except Exception:
+                pass
+        if phase == 'unbound':
+            try:
+                vpc_action(account, 'AssociateEipAddress', AllocationId=old_id,
+                           InstanceId=account['instance_id'], InstanceType='EcsInstance')
+                wait_eip(account, old_id, 'InUse', account['instance_id'])
+                detail += '；旧 EIP 已重新绑定。'
+                recovered = True
+            except Exception as rollback_exc:
+                detail += f'；旧 EIP 回绑失败：{rollback_exc}'
+        if new_id and (phase == 'allocated' or recovered):
+            try:
+                if describe_eip(account, new_id).get('Status') == 'Available':
+                    vpc_action(account, 'ReleaseEipAddress', AllocationId=new_id)
+                    detail += '；闲置新 EIP 已释放。'
+            except Exception as release_exc:
+                detail += f'；新 EIP 释放失败：{release_exc}'
+        if new_id:
+            detail += f'；新 EIP：{new_id}。'
+        if phase in ('bound', 'dns_updated'):
+            detail += '新 EIP 已绑定，旧 EIP 保留未释放，请核对 DNS 和费用。'
+        elif phase in ('unbinding', 'binding'):
+            detail += 'EIP 状态仍在变化，请先到阿里云控制台核查绑定，勿重复执行。'
+        raise RuntimeError(detail) from exc
+
+
+CF_SETUP_FIELDS = ('cf_domain', 'cf_zone_id', 'cf_api_token')
+CF_SETUP_PROMPTS = {
+    'cf_domain': '请输入这台机器对应的完整域名，例如 hk.example.com：',
+    'cf_zone_id': '请输入 Cloudflare Zone ID（32 位，可在域名概览页找到）：',
+    'cf_api_token': '请输入具有该 Zone 的 DNS Read/Edit 权限的 Cloudflare API Token。发送后机器人会尽量删除这条消息：',
+}
+
+
+def ip_choice_keyboard(accounts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton('一键更换所有启用账号', callback_data='ip:all')]]
+    rows.extend([[InlineKeyboardButton(account_name(acc), callback_data=f'ip:one:{i}')]
+                 for i, acc in enumerate(accounts)])
+    rows.append([InlineKeyboardButton('取消', callback_data='ip:cancel')])
+    return InlineKeyboardMarkup(rows)
+
+
+def prompt_ip_setup(context: CallbackContext, chat_id):
+    state = context.user_data['ip_setup']
+    keys = state['keys']
+    while state['index'] < len(keys):
+        account = find_account(keys[state['index']], include_disabled=True)
+        if not account:
+            state['index'] += 1
+            continue
+        missing = [field for field in CF_SETUP_FIELDS if not account.get(field)]
+        if missing:
+            state['field'] = missing[0]
+            context.bot.send_message(chat_id=chat_id, text=(
+                f'账号：{account_name(account)}\n尚缺 Cloudflare 配置。\n'
+                + CF_SETUP_PROMPTS[state['field']]
+            ))
+            return
+        state['index'] += 1
+    context.user_data.pop('ip_setup', None)
+    names = [account_name(find_account(key, include_disabled=True)) for key in keys
+             if find_account(key, include_disabled=True)]
+    context.bot.send_message(chat_id=chat_id, text=(
+        '准备更换：' + '、'.join(names) + '\n'
+        '会产生新 EIP 费用，解绑/绑定期间短暂断网；成功更新 CF 后才释放旧 EIP。\n确定执行？'
+    ), reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton('确认换 IP', callback_data='ip:confirm'),
+        InlineKeyboardButton('取消', callback_data='ip:cancel')
+    ]]))
+
+
+@run_async
+def changeip_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    accounts = load_accounts(include_disabled=True)
+    if not accounts:
+        update.message.reply_text('暂无账号。')
+        return
+    context.user_data.pop('ip_setup', None)
+    context.user_data.pop('ip_targets', None)
+    update.message.reply_text('选择要更换 EIP 的账号：', reply_markup=ip_choice_keyboard(accounts))
+
+
+@run_async
+def ip_callback(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    query = update.callback_query
+    query.answer()
+    action = query.data
+    if action == 'ip:cancel':
+        context.user_data.pop('ip_setup', None)
+        context.user_data.pop('ip_targets', None)
+        query.message.reply_text('已取消换 IP。')
+        return
+    if action == 'ip:confirm':
+        keys = context.user_data.pop('ip_targets', None)
+        if not keys:
+            query.message.reply_text('操作已过期，请重新发送 /changeip。')
+            return
+        context.user_data.pop('ip_setup', None)
+        accounts = [find_account(key, include_disabled=True) for key in keys]
+        domains = [str(acc.get('cf_domain') or '').lower() for acc in accounts if acc]
+        if len(domains) != len(set(domains)) or len(keys) != len(set(keys)):
+            query.message.reply_text('多个账号使用了相同实例或 CF 域名，请先分别配置，已取消本次操作。')
+            return
+        query.message.reply_text('开始换 IP，请等待逐台处理结果；期间不要重复点击。')
+        try:
+            with ip_rotation_lock():
+                for key in keys:
+                    account = find_account(key, include_disabled=True)
+                    if not account:
+                        result = f'❌ 账号 {key} 已被删除，跳过。'
+                    else:
+                        try:
+                            result = rotate_one_eip(account)
+                        except RuntimeError as exc:
+                            logging.exception('换 IP 失败：%s', account_name(account))
+                            query.message.reply_text(f'❌ {account_name(account)}：{exc}')
+                            query.message.reply_text('批量换 IP 已停止，请核查上一个账号状态后再操作。')
+                            break
+                        except Exception as exc:
+                            logging.exception('换 IP 失败：%s', account_name(account))
+                            result = f'❌ {account_name(account)}：{exc}'
+                    query.message.reply_text(result)
+        except ValueError as exc:
+            query.message.reply_text(str(exc))
+        return
+    accounts = load_accounts(include_disabled=True)
+    if action == 'ip:all':
+        selected = [acc for acc in accounts if account_enabled(acc)]
+    elif action.startswith('ip:one:') and action[7:].isdigit():
+        idx = int(action[7:])
+        selected = [accounts[idx]] if 0 <= idx < len(accounts) else []
+    else:
+        selected = []
+    if not selected:
+        query.message.reply_text('没有可选账号，请重新发送 /changeip。')
+        return
+    keys = [account_key(acc) for acc in selected]
+    context.user_data['ip_targets'] = keys
+    context.user_data['ip_setup'] = {'keys': keys, 'index': 0}
+    prompt_ip_setup(context, query.message.chat_id)
+
+
+@run_async
+def ip_setup_message(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    state = context.user_data.get('ip_setup')
+    if not state:
+        return
+    account = find_account(state['keys'][state['index']], include_disabled=True)
+    if not account:
+        context.user_data.pop('ip_setup', None)
+        update.message.reply_text('账号已变化，请重新发送 /changeip。')
+        return
+    field = state['field']
+    value = update.message.text.strip()
+    if field == 'cf_api_token':
+        try:
+            update.message.delete()
+        except Exception:
+            update.message.reply_text('无法删除包含 Token 的消息，请手动删除并考虑更换 Token。')
+    if field == 'cf_domain':
+        value = value.lower().rstrip('.')
+        if not re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', value) or len(value) > 253:
+            update.message.reply_text('域名格式不正确，请重新输入完整域名。')
+            return
+    elif field == 'cf_zone_id' and not re.fullmatch(r'[a-fA-F0-9]{32}', value):
+        update.message.reply_text('Zone ID 应为 32 位十六进制字符串，请重新输入。')
+        return
+    elif field == 'cf_api_token' and (not value or len(value) > 512):
+        update.message.reply_text('Token 为空或过长，请重新输入。')
+        return
+    accounts = load_accounts(include_disabled=True)
+    for item in accounts:
+        if account_key(item) == account_key(account):
+            item[field] = value
+            break
+    save_accounts(accounts)
+    prompt_ip_setup(context, update.effective_chat.id)
+
+
 @run_async
 def help_command(update: Update, context: CallbackContext):
     if not is_admin(update):
@@ -1267,6 +1621,41 @@ def send_report_now():
     sent = send_status_messages_to_tg(TELEGRAM_CHAT_ID)
     logging.info(f'已手动按账号分别发送 {sent} 条日报到频道。')
 
+
+def register_bot_menu():
+    commands = [
+        {'command': 'status', 'description': '查看所有账号状态'},
+        {'command': 'traffic', 'description': '查看 CDT 流量'},
+        {'command': 'bill', 'description': '查看余额和本月消费'},
+        {'command': 'report', 'description': '立即发送所有账号报告'},
+        {'command': 'startvps', 'description': '启动指定账号实例'},
+        {'command': 'stopvps', 'description': '停止指定账号实例'},
+        {'command': 'keepon', 'description': '开启指定账号保活'},
+        {'command': 'keepoff', 'description': '关闭指定账号保活'},
+        {'command': 'changeip', 'description': '选择账号更换 EIP 并更新 CF'},
+        {'command': 'help', 'description': '查看命令说明'},
+    ]
+    base = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
+    scopes = [{'type': 'default'}, {'type': 'chat', 'chat_id': int(ADMIN_USER_ID)}]
+    for scope in scopes:
+        for language in (('', 'zh', 'en') if scope['type'] == 'chat' else ('',)):
+            try:
+                response = requests.post(f'{base}/setMyCommands', json={
+                    'commands': commands, 'scope': scope, 'language_code': language
+                }, timeout=10)
+                if not response.ok or not response.json().get('ok'):
+                    logging.warning('设置 TG 命令菜单失败：%s', response.text)
+            except Exception as exc:
+                logging.warning('设置 TG 命令菜单失败：%s', type(exc).__name__)
+    try:
+        response = requests.post(f'{base}/setChatMenuButton', json={
+            'chat_id': int(ADMIN_USER_ID), 'menu_button': {'type': 'commands'}
+        }, timeout=10)
+        if not response.ok or not response.json().get('ok'):
+            logging.warning('设置 TG 菜单按钮失败：%s', response.text)
+    except Exception as exc:
+        logging.warning('设置 TG 菜单按钮失败：%s', type(exc).__name__)
+
 # =========================
 # 主入口
 # =========================
@@ -1351,7 +1740,11 @@ def main():
     dispatcher.add_handler(CommandHandler('keepon', keepon_command))
     dispatcher.add_handler(CommandHandler('keepoff', keepoff_command))
     dispatcher.add_handler(CommandHandler('report', report_command))
+    dispatcher.add_handler(CommandHandler('changeip', changeip_command))
+    dispatcher.add_handler(CallbackQueryHandler(ip_callback, pattern=r'^ip:'))
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, ip_setup_message))
 
+    register_bot_menu()
     updater.start_polling(clean=True)
     logging.info('Telegram Bot 已启动：多账号模式，日报由 cron 按北京时间判断发送。')
     updater.idle()

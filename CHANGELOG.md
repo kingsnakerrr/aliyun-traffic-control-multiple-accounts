@@ -1,3 +1,9 @@
+## 2026-11-19 Telegram 换 EIP 与 Cloudflare 解析
+
+- 新增 `/changeip` 单账号或所有启用账号换 EIP，缺少域名/Zone ID/Token 时逐台引导，执行前二次确认。
+- 仅支持直绑 ECS 的普通按量 EIP；检查旧 EIP 和 CF 记录后申请新 EIP，绑定及 DNS 回读成功才释放旧 EIP。
+- 机器人启动时刷新 Telegram 命令菜单；`cdt` 查看账号配置时隐藏 AccessKey 和 CF Token。
+- `accounts.json` 改为原子写入，升级时增加主程序语法检查。
 
 ## 2026-07-30 状态显示简化和区域输入提示
 

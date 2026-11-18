@@ -2,6 +2,8 @@ accounts.json
 traffic_control.py
 last_notify_state.json
 last_notify_state.lock
+ip_rotation.lock
+.accounts-*
 keepalive_enabled.flag
 cron_run.log
 *.log
