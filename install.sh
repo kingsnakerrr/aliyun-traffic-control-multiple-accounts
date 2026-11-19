@@ -68,9 +68,11 @@ fi
 
 mkdir -p "$BASE_DIR"
 curl -fsSL "${REPO_RAW}/traffic_control.py.template" -o "${BASE_DIR}/traffic_control.py.template"
+curl -fsSL "${REPO_RAW}/GUIDE.md" -o "${BASE_DIR}/GUIDE.md"
 curl -fsSL "${REPO_RAW}/traffic-control.service" -o "/etc/systemd/system/${SERVICE_NAME}"
 curl -fsSL "${REPO_RAW}/cdt" -o "/usr/local/bin/cdt"
 chmod +x /usr/local/bin/cdt
+chmod 0644 "${BASE_DIR}/GUIDE.md"
 
 export BASE_DIR TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ADMIN_USER_ID
 python3 - <<'PYCONF'

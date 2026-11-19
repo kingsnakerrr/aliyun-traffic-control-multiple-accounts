@@ -43,6 +43,8 @@ KEEPALIVE_FLAG_FILE = os.path.join(BASE_DIR, 'keepalive_enabled.flag')
 LAST_NOTIFY_FILE = os.path.join(BASE_DIR, 'last_notify_state.json')
 NOTIFY_LOCK_FILE = os.path.join(BASE_DIR, 'last_notify_state.lock')
 IP_ROTATION_LOCK_FILE = os.path.join(BASE_DIR, 'ip_rotation.lock')
+GUIDE_FILE = os.path.join(BASE_DIR, 'GUIDE.md')
+GUIDE_URL = 'https://github.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/blob/main/GUIDE.md'
 
 MONTHLY_RESET_OPEN_HOUR = 0
 MONTHLY_RESET_OPEN_MINUTE = 5
@@ -696,6 +698,7 @@ def build_help_text() -> str:
         '/keepoff 账号名或序号 - 暂停指定账号自动保活\n'
         '/changeip - 选择单账号或批量更换 EIP 并更新 Cloudflare\n'
         '/cfconfig - 修改账号的 Cloudflare 域名、区域 ID 或令牌\n'
+        '/guide - 下载配置与换 IP 操作教程\n'
         '/cancel - 取消当前配置输入\n'
         '/help - 查看命令帮助\n\n'
         '说明：\n'
@@ -1265,6 +1268,20 @@ def verify_cf_zone(account: Dict[str, Any]) -> str:
     return zone_name
 
 
+def preflight_rotation(account: Dict[str, Any], require_record: bool = False) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    missing = validate_account(account)
+    if missing:
+        raise ValueError('阿里云账号配置缺少：' + ', '.join(missing))
+    verify_cf_zone(account)
+    old = current_eip(account)
+    record = cf_record(account)
+    if record and record.get('content') != old['IpAddress']:
+        raise ValueError(f'{account["cf_domain"]} 当前解析与旧 EIP {old["IpAddress"]} 不一致，已停止以防改错记录。')
+    if require_record and not record:
+        raise ValueError('Cloudflare 中没有该域名的 A 记录；批量模式不会自动创建，请先在 CF 配置并验证。')
+    return old, record
+
+
 @contextmanager
 def ip_rotation_lock():
     ensure_base_dir()
@@ -1283,12 +1300,8 @@ def ip_rotation_lock():
 
 
 def rotate_one_eip(account: Dict[str, Any]) -> str:
-    verify_cf_zone(account)
-    old = current_eip(account)
+    old, record = preflight_rotation(account)
     old_id, old_ip = old['AllocationId'], old['IpAddress']
-    record = cf_record(account)
-    if record and record.get('content') != old_ip:
-        raise ValueError(f'{account["cf_domain"]} 当前解析与旧 EIP {old_ip} 不一致，已停止以防改错记录。')
     if not record:
         data = cf_request(account, 'POST', 'dns_records', json={
             'type': 'A', 'name': account['cf_domain'], 'content': old_ip,
@@ -1365,7 +1378,7 @@ CF_SETUP_FIELDS = ('cf_domain', 'cf_zone_id', 'cf_api_token')
 CF_SETUP_PROMPTS = {
     'cf_domain': '请输入这台机器对应的完整域名，例如 hk.example.com：',
     'cf_zone_id': '请输入 Cloudflare Zone ID（32 位，可在域名概览页找到）：',
-    'cf_api_token': '请输入具有该 Zone 的 DNS Read/Edit 权限的 Cloudflare API Token。发送后机器人会尽量删除这条消息：',
+    'cf_api_token': '请输入仅授权目标区域 DNS 编辑的 Cloudflare API Token（不是 Global API Key）。发送后机器人会尽量删除这条消息：',
 }
 CF_FIELD_CODES = {'domain': 'cf_domain', 'zone': 'cf_zone_id', 'token': 'cf_api_token'}
 
@@ -1421,7 +1434,7 @@ def show_cf_config_panel(context: CallbackContext, chat_id, index: int):
 
 
 def ip_choice_keyboard(accounts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton('一键更换所有启用账号', callback_data='ip:all')]]
+    rows = [[InlineKeyboardButton('一键更换已配置启用账号', callback_data='ip:all')]]
     rows.extend([[InlineKeyboardButton(account_name(acc), callback_data=f'ip:one:{i}')]
                  for i, acc in enumerate(accounts)])
     rows.append([InlineKeyboardButton('修改 Cloudflare 配置', callback_data='ip:configlist')])
@@ -1476,6 +1489,26 @@ def prompt_ip_setup(context: CallbackContext, chat_id):
     ]]))
 
 
+def prompt_bulk_confirmation(context: CallbackContext, chat_id, accounts: List[Dict[str, Any]], skipped: List[str]):
+    if skipped:
+        context.bot.send_message(chat_id=chat_id, text='已跳过以下账号（不会进入配置流程）：\n' + '\n'.join(skipped))
+    if not accounts:
+        context.bot.send_message(chat_id=chat_id, text='没有预检通过的启用账号。请用 /cfconfig 修正配置，或用 /guide 下载教程。')
+        return
+    keys = [account_key(acc) for acc in accounts]
+    context.user_data['ip_targets'] = keys
+    context.user_data['ip_bulk'] = True
+    names = '、'.join(account_name(acc) for acc in accounts)
+    context.bot.send_message(chat_id=chat_id, text=(
+        f'批量只读预检通过 {len(accounts)} 台：{names}\n'
+        '预检无法验证 RAM 写入权限或 EIP 申请配额，实际执行仍可能失败。\n'
+        '会产生新 EIP 费用，解绑/绑定期间短暂断网；成功更新 CF 后才释放旧 EIP。\n确定执行？'
+    ), reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton('确认换 IP', callback_data='ip:confirm'),
+        InlineKeyboardButton('取消', callback_data='ip:cancel')
+    ]]))
+
+
 @run_async
 def changeip_command(update: Update, context: CallbackContext):
     if not is_admin(update):
@@ -1486,6 +1519,7 @@ def changeip_command(update: Update, context: CallbackContext):
         return
     context.user_data.pop('ip_setup', None)
     context.user_data.pop('ip_targets', None)
+    context.user_data.pop('ip_bulk', None)
     context.user_data.pop('ip_edit', None)
     update.message.reply_text('选择要更换 EIP 的账号：', reply_markup=ip_choice_keyboard(accounts))
 
@@ -1500,6 +1534,7 @@ def cfconfig_command(update: Update, context: CallbackContext):
         return
     context.user_data.pop('ip_setup', None)
     context.user_data.pop('ip_targets', None)
+    context.user_data.pop('ip_bulk', None)
     context.user_data.pop('ip_edit', None)
     update.message.reply_text('选择要修改 Cloudflare 配置的账号：',
                               reply_markup=cf_config_keyboard(accounts))
@@ -1509,7 +1544,7 @@ def cfconfig_command(update: Update, context: CallbackContext):
 def cancel_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
-    for key in ('ip_setup', 'ip_targets', 'ip_edit'):
+    for key in ('ip_setup', 'ip_targets', 'ip_bulk', 'ip_edit'):
         context.user_data.pop(key, None)
     update.message.reply_text('已取消当前操作。')
 
@@ -1524,12 +1559,14 @@ def ip_callback(update: Update, context: CallbackContext):
     if action == 'ip:cancel':
         context.user_data.pop('ip_setup', None)
         context.user_data.pop('ip_targets', None)
+        context.user_data.pop('ip_bulk', None)
         context.user_data.pop('ip_edit', None)
         query.message.reply_text('已取消换 IP。')
         return
     if action == 'ip:configlist':
         context.user_data.pop('ip_setup', None)
         context.user_data.pop('ip_targets', None)
+        context.user_data.pop('ip_bulk', None)
         context.user_data.pop('ip_edit', None)
         accounts = load_accounts(include_disabled=True)
         query.message.reply_text('选择要修改 Cloudflare 配置的账号：',
@@ -1538,6 +1575,7 @@ def ip_callback(update: Update, context: CallbackContext):
     if action.startswith('ip:config:') and action[10:].isdigit():
         context.user_data.pop('ip_setup', None)
         context.user_data.pop('ip_targets', None)
+        context.user_data.pop('ip_bulk', None)
         context.user_data.pop('ip_edit', None)
         show_cf_config_panel(context, query.message.chat_id, int(action[10:]))
         return
@@ -1550,6 +1588,7 @@ def ip_callback(update: Update, context: CallbackContext):
                 field = CF_FIELD_CODES[parts[3]]
                 context.user_data.pop('ip_setup', None)
                 context.user_data.pop('ip_targets', None)
+                context.user_data.pop('ip_bulk', None)
                 context.user_data['ip_edit'] = {'key': account_key(accounts[index]), 'field': field}
                 query.message.reply_text(f'账号：{account_name(accounts[index])}\n{CF_SETUP_PROMPTS[field]}\n发送 /cancel 可取消。')
                 return
@@ -1571,6 +1610,7 @@ def ip_callback(update: Update, context: CallbackContext):
         return
     if action == 'ip:confirm':
         keys = context.user_data.pop('ip_targets', None)
+        bulk = context.user_data.pop('ip_bulk', False)
         if not keys:
             query.message.reply_text('操作已过期，请重新发送 /changeip。')
             return
@@ -1587,7 +1627,19 @@ def ip_callback(update: Update, context: CallbackContext):
                     account = find_account(key, include_disabled=True)
                     if not account:
                         result = f'❌ 账号 {key} 已被删除，跳过。'
+                    elif bulk and not account_enabled(account):
+                        result = f'⏭ {account_name(account)}：账号已禁用，跳过。'
                     else:
+                        if bulk:
+                            try:
+                                preflight_rotation(account, require_record=True)
+                            except ValueError as exc:
+                                query.message.reply_text(f'⏭ {account_name(account)}：配置或状态已变化，预检未通过：{exc}')
+                                continue
+                            except Exception:
+                                logging.exception('确认后批量预检失败：%s', account_name(account))
+                                query.message.reply_text(f'⏭ {account_name(account)}：预检查询失败，已跳过。')
+                                continue
                         try:
                             result = rotate_one_eip(account)
                         except RuntimeError as exc:
@@ -1604,7 +1656,36 @@ def ip_callback(update: Update, context: CallbackContext):
         return
     accounts = load_accounts(include_disabled=True)
     if action == 'ip:all':
-        selected = [acc for acc in accounts if account_enabled(acc)]
+        context.user_data.pop('ip_setup', None)
+        context.user_data.pop('ip_targets', None)
+        context.user_data.pop('ip_bulk', None)
+        selected = []
+        skipped = []
+        seen_instances = set()
+        seen_domains = set()
+        for acc in accounts:
+            if not account_enabled(acc):
+                continue
+            name = account_name(acc)
+            instance = str(acc.get('instance_id') or '')
+            domain = str(acc.get('cf_domain') or '').lower().rstrip('.')
+            if instance in seen_instances or domain in seen_domains:
+                skipped.append(f'• {name}：实例或 CF 域名与已选账号重复。')
+                continue
+            try:
+                preflight_rotation(acc, require_record=True)
+            except ValueError as exc:
+                skipped.append(f'• {name}：{exc}')
+                continue
+            except Exception:
+                logging.exception('批量换 IP 预检失败：%s', name)
+                skipped.append(f'• {name}：预检查询失败，请检查阿里云/CF 权限、网络和服务日志。')
+                continue
+            selected.append(acc)
+            seen_instances.add(instance)
+            seen_domains.add(domain)
+        prompt_bulk_confirmation(context, query.message.chat_id, selected, skipped)
+        return
     elif action.startswith('ip:one:') and action[7:].isdigit():
         idx = int(action[7:])
         selected = [accounts[idx]] if 0 <= idx < len(accounts) else []
@@ -1615,6 +1696,7 @@ def ip_callback(update: Update, context: CallbackContext):
         return
     keys = [account_key(acc) for acc in selected]
     context.user_data['ip_targets'] = keys
+    context.user_data.pop('ip_bulk', None)
     context.user_data['ip_setup'] = {'keys': keys, 'index': 0}
     prompt_ip_setup(context, query.message.chat_id)
 
@@ -1685,6 +1767,25 @@ def help_command(update: Update, context: CallbackContext):
     if not is_admin(update):
         return
     context.bot.send_message(chat_id=get_chat_id(update), text=build_help_text())
+
+
+@run_async
+def guide_command(update: Update, context: CallbackContext):
+    if not is_admin(update):
+        return
+    if not os.path.isfile(GUIDE_FILE):
+        context.bot.send_message(chat_id=get_chat_id(update), text=f'教程文件尚未安装。请在 SSH 运行 cdt，选择 x 一键升级后重试。\n也可直接下载：{GUIDE_URL}')
+        return
+    try:
+        with open(GUIDE_FILE, 'rb') as guide:
+            context.bot.send_document(
+                chat_id=get_chat_id(update), document=guide,
+                filename='aliyun-cdt-guide.md',
+                caption='阿里云 RAM、Cloudflare、换 IP 与故障排查教程'
+            )
+    except Exception:
+        logging.exception('发送操作教程失败')
+        context.bot.send_message(chat_id=get_chat_id(update), text=f'发送教程失败，请检查服务日志。也可直接下载：{GUIDE_URL}')
 
 
 @run_async
@@ -1817,6 +1918,7 @@ def register_bot_menu():
         {'command': 'keepoff', 'description': '关闭指定账号保活'},
         {'command': 'changeip', 'description': '选择账号更换 EIP 并更新 CF'},
         {'command': 'cfconfig', 'description': '修改并验证 Cloudflare 配置'},
+        {'command': 'guide', 'description': '下载完整操作教程'},
         {'command': 'cancel', 'description': '取消当前配置输入'},
         {'command': 'help', 'description': '查看命令说明'},
     ]
@@ -1917,6 +2019,7 @@ def main():
 
     dispatcher = updater.dispatcher
     dispatcher.add_handler(CommandHandler('help', help_command))
+    dispatcher.add_handler(CommandHandler('guide', guide_command))
     dispatcher.add_handler(CommandHandler('status', status_command))
     dispatcher.add_handler(CommandHandler('traffic', traffic_command))
     dispatcher.add_handler(CommandHandler('bill', bill_command))

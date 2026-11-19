@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -41,6 +42,7 @@ real_verify_cf_zone = app.verify_cf_zone
 
 ACCOUNT = {
     'name': 'test-hk', 'instance_id': 'i-test', 'region_id': 'cn-hongkong',
+    'access_key_id': 'test-id', 'access_key_secret': 'test-secret',
     'cf_domain': 'hk.example.com', 'cf_zone_id': 'a' * 32,
     'cf_api_token': 'test-token',
 }
@@ -68,6 +70,18 @@ class RotationTests(unittest.TestCase):
         commands = post.call_args_list[0].kwargs['json']['commands']
         self.assertIn('changeip', [command['command'] for command in commands])
         self.assertIn('cfconfig', [command['command'] for command in commands])
+        self.assertIn('guide', [command['command'] for command in commands])
+
+    def test_guide_sends_downloadable_file(self):
+        context = Mock()
+        update = Mock()
+        guide = source.parent / 'GUIDE.md'
+        with (patch.object(app, 'is_admin', return_value=True),
+              patch.object(app, 'GUIDE_FILE', str(guide)),
+              patch.object(app, 'get_chat_id', return_value=123)):
+            app.guide_command(update, context)
+        self.assertEqual(context.bot.send_document.call_args.kwargs['filename'], 'aliyun-cdt-guide.md')
+        self.assertEqual(context.bot.send_document.call_args.kwargs['chat_id'], 123)
 
     def test_cf_config_field_can_be_replaced(self):
         context = Mock(user_data={})
@@ -128,6 +142,87 @@ class RotationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'wrong zone'):
                 app.rotate_one_eip(ACCOUNT)
             current.assert_not_called()
+
+    def test_bulk_preflight_requires_existing_matching_dns_record(self):
+        with (patch.object(app, 'current_eip', return_value=OLD),
+              patch.object(app, 'cf_record', return_value=None),
+              patch.object(app, 'vpc_action') as vpc):
+            with self.assertRaisesRegex(ValueError, '没有该域名的 A 记录'):
+                app.preflight_rotation(ACCOUNT, require_record=True)
+            vpc.assert_not_called()
+
+    def test_bulk_skips_unconfigured_and_failed_accounts_without_setup(self):
+        valid = dict(ACCOUNT)
+        invalid = dict(ACCOUNT, name='missing-cf', instance_id='i-missing', cf_domain='')
+        disabled = dict(ACCOUNT, name='disabled', instance_id='i-disabled', enabled=False)
+        context = Mock(user_data={})
+        context.user_data = {}
+        update = Mock()
+        update.callback_query.data = 'ip:all'
+        update.callback_query.message.chat_id = 123
+
+        def preflight(account, require_record=False):
+            self.assertTrue(require_record)
+            if account['name'] == 'missing-cf':
+                raise ValueError('Cloudflare 域名格式不正确。')
+            return OLD, {'id': 'dns-1', 'content': OLD['IpAddress']}
+
+        with (patch.object(app, 'is_admin', return_value=True),
+              patch.object(app, 'load_accounts', return_value=[valid, invalid, disabled]),
+              patch.object(app, 'preflight_rotation', side_effect=preflight) as check,
+              patch.object(app, 'prompt_ip_setup') as setup):
+            app.ip_callback(update, context)
+        setup.assert_not_called()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(context.user_data['ip_targets'], [app.account_key(valid)])
+        self.assertTrue(context.user_data['ip_bulk'])
+        messages = [call.kwargs['text'] for call in context.bot.send_message.call_args_list]
+        self.assertIn('missing-cf', messages[0])
+        self.assertIn('预检通过 1 台', messages[1])
+        self.assertNotIn('disabled', ''.join(messages))
+
+    def test_bulk_all_failed_offers_no_confirm(self):
+        context = Mock(user_data={})
+        context.user_data = {}
+        update = Mock()
+        update.callback_query.data = 'ip:all'
+        update.callback_query.message.chat_id = 123
+        with (patch.object(app, 'is_admin', return_value=True),
+              patch.object(app, 'load_accounts', return_value=[ACCOUNT]),
+              patch.object(app, 'preflight_rotation', side_effect=ValueError('Forbidden.RAM'))):
+            app.ip_callback(update, context)
+        self.assertNotIn('ip_targets', context.user_data)
+        self.assertIn('没有预检通过', context.bot.send_message.call_args.kwargs['text'])
+
+    def test_bulk_confirm_skips_account_disabled_after_preflight(self):
+        account = dict(ACCOUNT, enabled=False)
+        key = app.account_key(account)
+        context = Mock(user_data={})
+        context.user_data = {'ip_targets': [key], 'ip_bulk': True}
+        update = Mock()
+        update.callback_query.data = 'ip:confirm'
+        with (patch.object(app, 'is_admin', return_value=True),
+              patch.object(app, 'find_account', return_value=account),
+              patch.object(app, 'ip_rotation_lock', return_value=nullcontext()),
+              patch.object(app, 'rotate_one_eip') as rotate):
+            app.ip_callback(update, context)
+        rotate.assert_not_called()
+        self.assertIn('已禁用', update.callback_query.message.reply_text.call_args.args[0])
+
+    def test_bulk_confirm_rechecks_and_skips_stale_dns(self):
+        key = app.account_key(ACCOUNT)
+        context = Mock(user_data={})
+        context.user_data = {'ip_targets': [key], 'ip_bulk': True}
+        update = Mock()
+        update.callback_query.data = 'ip:confirm'
+        with (patch.object(app, 'is_admin', return_value=True),
+              patch.object(app, 'find_account', return_value=ACCOUNT),
+              patch.object(app, 'ip_rotation_lock', return_value=nullcontext()),
+              patch.object(app, 'preflight_rotation', side_effect=ValueError('DNS 已变化')),
+              patch.object(app, 'rotate_one_eip') as rotate):
+            app.ip_callback(update, context)
+        rotate.assert_not_called()
+        self.assertIn('预检未通过', update.callback_query.message.reply_text.call_args.args[0])
 
     def test_dns_mismatch_stops_before_allocation(self):
         with (patch.object(app, 'current_eip', return_value=OLD),

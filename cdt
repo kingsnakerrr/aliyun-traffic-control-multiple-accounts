@@ -48,17 +48,18 @@ backup_accounts(){ cp -a "$ACCOUNTS_FILE" "${ACCOUNTS_FILE}.bak.$(date +%Y%m%d%H
 account_count(){ run_app --account-count 2>/dev/null || echo 0; }
 
 upgrade_program(){
-  echo "一键升级会更新主程序、cdt 菜单和 systemd service。"
+  echo "一键升级会更新主程序、cdt 菜单、systemd service 和操作教程。"
   echo "不会覆盖 accounts.json、通知状态、日志或 venv。"
   read -r -p "确定升级？输入 yes 继续: " ans
   [ "$ans" = "yes" ] || { echo "已取消升级"; return; }
 
-  local ts tmp_tpl tmp_cdt tmp_service py_bin
+  local ts tmp_tpl tmp_cdt tmp_service tmp_guide py_bin
   ts="$(date +%Y%m%d%H%M%S)"
   tmp_tpl="$(mktemp)"
   tmp_cdt="$(mktemp)"
   tmp_service="$(mktemp)"
-  cleanup_upgrade_tmp(){ rm -f "$tmp_tpl" "$tmp_cdt" "$tmp_service"; }
+  tmp_guide="$(mktemp)"
+  cleanup_upgrade_tmp(){ rm -f "$tmp_tpl" "$tmp_cdt" "$tmp_service" "$tmp_guide"; }
 
   echo "正在下载最新版文件..."
   if ! curl -fsSL "${REPO_RAW}/traffic_control.py.template" -o "$tmp_tpl"; then
@@ -73,6 +74,11 @@ upgrade_program(){
   fi
   if ! curl -fsSL "${REPO_RAW}/traffic-control.service" -o "$tmp_service"; then
     echo "下载 traffic-control.service 失败，升级中止。"
+    cleanup_upgrade_tmp
+    return
+  fi
+  if ! curl -fsSL "${REPO_RAW}/GUIDE.md" -o "$tmp_guide"; then
+    echo "下载 GUIDE.md 失败，升级中止。"
     cleanup_upgrade_tmp
     return
   fi
@@ -138,6 +144,8 @@ PYUP
   cp -f "$tmp_cdt" /usr/local/bin/cdt
   chmod +x /usr/local/bin/cdt
   cp -f "$tmp_service" "/etc/systemd/system/${SERVICE_NAME}"
+  cp -f "$tmp_guide" "${BASE_DIR}/GUIDE.md"
+  chmod 0644 "${BASE_DIR}/GUIDE.md"
   systemctl daemon-reload || true
   if ! systemctl restart "$SERVICE_NAME"; then
     echo "新版文件已写入，但服务重启失败。请运行：systemctl status traffic-control -l --no-pager"
