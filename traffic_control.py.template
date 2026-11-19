@@ -9,6 +9,8 @@ import tempfile
 import logging
 import ipaddress
 import time
+import subprocess
+import getpass
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
@@ -43,6 +45,7 @@ KEEPALIVE_FLAG_FILE = os.path.join(BASE_DIR, 'keepalive_enabled.flag')
 LAST_NOTIFY_FILE = os.path.join(BASE_DIR, 'last_notify_state.json')
 NOTIFY_LOCK_FILE = os.path.join(BASE_DIR, 'last_notify_state.lock')
 IP_ROTATION_LOCK_FILE = os.path.join(BASE_DIR, 'ip_rotation.lock')
+NODE_SSH_DIR = os.path.join(BASE_DIR, 'node-ssh')
 GUIDE_FILE = os.path.join(BASE_DIR, 'GUIDE.md')
 GUIDE_URL = 'https://github.com/kingsnakerrr/aliyun-traffic-control-multiple-accounts/blob/main/GUIDE.md'
 
@@ -887,8 +890,11 @@ class UserCancelled(Exception):
     pass
 
 def prompt(msg: str, default: Optional[str] = None, secret: bool = False) -> str:
-    # secret 保留参数，避免额外依赖 getpass；root 终端录入简单直接。
     try:
+        if secret:
+            suffix = '（留空保留原值）' if default else ''
+            val = getpass.getpass(f'{msg}{suffix}: ').strip()
+            return val or (default or '')
         if default is None or default == '':
             val = input(f'{msg}: ').strip()
         else:
@@ -926,7 +932,7 @@ def build_account_from_prompt(existing: Optional[Dict[str, Any]] = None) -> Dict
     acc = dict(existing)
     acc['name'] = prompt('账号显示名称，例如 zymsdf-香港', existing.get('name', 'zymsdf'))
     acc['access_key_id'] = prompt('阿里云 ACCESS_KEY_ID', existing.get('access_key_id'))
-    acc['access_key_secret'] = prompt('阿里云 ACCESS_KEY_SECRET', existing.get('access_key_secret'))
+    acc['access_key_secret'] = prompt('阿里云 ACCESS_KEY_SECRET', existing.get('access_key_secret'), secret=True)
     print(ECS_REGION_HELP)
     acc['region_id'] = prompt('ECS 区域，例如香港 cn-hongkong / 日本 ap-northeast-1', existing.get('region_id', 'cn-hongkong'))
     acc['instance_id'] = prompt('ECS 实例 ID', existing.get('instance_id'))
@@ -1050,6 +1056,194 @@ def edit_account_cli():
             new_accounts.append(acc)
     save_accounts(new_accounts)
     print(f'✅ 已更新账号：{account_name(new_acc)}')
+
+
+def validate_node_ssh(account: Dict[str, Any], require_key: bool = True) -> Optional[Tuple[str, str, int, str]]:
+    host = str(account.get('node_ssh_host') or '').strip().lower()
+    if not host:
+        return None
+    user = str(account.get('node_ssh_user') or 'root').strip()
+    key_path = str(account.get('node_ssh_key_path') or '').strip()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', host) or len(host) > 253:
+            raise ValueError('节点 SSH 地址不是有效域名或 IP。')
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
+        raise ValueError('节点 SSH 用户名格式不正确。')
+    try:
+        port = int(account.get('node_ssh_port') or 22)
+    except (TypeError, ValueError):
+        raise ValueError('节点 SSH 端口格式不正确。')
+    if not 1 <= port <= 65535:
+        raise ValueError('节点 SSH 端口超出范围。')
+    if not os.path.isabs(key_path) or (require_key and not os.path.isfile(key_path)):
+        raise ValueError('节点 SSH 私钥不存在，请在 cdt -> s 重新配置。')
+    return host, user, port, key_path
+
+
+NODE_NFT_SCRIPT = r'''set -eu
+if command -v nft >/dev/null 2>&1; then
+  echo NFT_PRESENT
+else
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache nftables >/dev/null
+  elif command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q nftables >/dev/null
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q nftables >/dev/null
+  else
+    echo NO_SUPPORTED_PACKAGE_MANAGER >&2
+    exit 41
+  fi
+  echo NFT_INSTALLED
+fi
+if ! command -v nft >/dev/null 2>&1; then
+  echo NFT_NOT_AVAILABLE >&2
+  exit 42
+fi
+config=/usr/local/etc/xray/config.json
+if [ ! -f "$config" ]; then
+  echo HOP_CONFIG_UNKNOWN >&2
+  exit 45
+fi
+hop_ranges=$(grep -oE '"mmwxHopPorts"[[:space:]]*:[[:space:]]*"[^"]+"' "$config" | sed -E 's/.*"([^"]+)"$/\1/' || true)
+rules_ready() {
+  rules=$(nft list ruleset 2>/dev/null) || return 1
+  printf '%s\n' "$rules" | grep -q 'table inet mmwx_hop' || return 1
+  printf '%s\n' "$hop_ranges" | while IFS= read -r range; do
+    printf '%s\n' "$rules" | grep -Fq "udp dport $range" || exit 1
+  done
+}
+if [ -n "$hop_ranges" ]; then
+  if rules_ready; then
+    echo HOP_READY
+  else
+    if command -v rc-service >/dev/null 2>&1 && rc-service mmw-agent status >/dev/null 2>&1; then
+      rc-service mmw-agent restart >/dev/null
+    elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mmw-agent; then
+      systemctl restart mmw-agent
+    else
+      echo MMW_AGENT_NOT_FOUND >&2
+      exit 43
+    fi
+    attempt=0
+    while [ "$attempt" -lt 15 ]; do
+      sleep 2
+      if rules_ready; then
+        echo HOP_READY
+        exit 0
+      fi
+      attempt=$((attempt + 1))
+    done
+    echo HOP_RULE_NOT_READY >&2
+    exit 44
+  fi
+else
+  echo NO_HOP_CONFIG
+fi
+'''
+
+
+def prepare_node_nftables(account: Dict[str, Any], address: str) -> str:
+    ssh = validate_node_ssh(account)
+    if not ssh:
+        return '未配置节点 SSH，未检查 nftables；在 cdt -> s 配置一次。'
+    host, user, port, key_path = ssh
+    ipaddress.ip_address(address)
+    command = [
+        'ssh', '-T', '-i', key_path, '-p', str(port),
+        '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+        '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
+        '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10',
+        '-o', f'HostKeyAlias={host}', f'{user}@{address}', 'sh', '-s'
+    ]
+    try:
+        for attempt in range(3):
+            result = subprocess.run(command, input=NODE_NFT_SCRIPT, text=True,
+                                    capture_output=True, timeout=180, check=False)
+            if result.returncode != 255 or attempt == 2:
+                break
+            time.sleep(5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f'节点 SSH 检查未完成：{type(exc).__name__}') from exc
+    if result.returncode:
+        errors = {
+            41: '节点没有受支持的包管理器。',
+            42: 'nftables 安装后仍不可用。',
+            43: '需要重建跳跃规则，但找不到妙妙屋 Agent 服务。',
+            44: '妙妙屋 Agent 重启后仍未建立跳跃规则。',
+            45: '找不到标准 Xray 配置，无法确认 HY2 跳跃规则。',
+        }
+        raise ValueError(errors.get(result.returncode,
+                                    f'节点 SSH 或软件安装失败（退出码 {result.returncode}）。'))
+    installed = 'NFT_INSTALLED' in result.stdout
+    if 'HOP_READY' in result.stdout:
+        return 'nftables 已安装并确认 HY2 跳跃规则。' if installed else 'HY2 跳跃规则正常。'
+    return '已安装 nftables；当前节点未配置 HY2 跳跃。' if installed else 'nftables 已存在；当前节点未配置 HY2 跳跃。'
+
+
+def setup_node_ssh_cli():
+    account = get_selected_account_cli()
+    if not account:
+        return
+    host = prompt('节点 SSH 域名（换 IP 后仍使用的域名）', account.get('node_ssh_host') or account.get('cf_domain'))
+    user = prompt('节点 SSH 用户', account.get('node_ssh_user') or 'root')
+    port = prompt('节点 SSH 端口', str(account.get('node_ssh_port') or 22))
+    key_path = os.path.join(NODE_SSH_DIR, account_key(account))
+    candidate = dict(account, node_ssh_host=host, node_ssh_user=user,
+                     node_ssh_port=port, node_ssh_key_path=key_path)
+    validate_node_ssh(candidate, require_key=False)
+    os.makedirs(NODE_SSH_DIR, mode=0o700, exist_ok=True)
+    os.chmod(NODE_SSH_DIR, 0o700)
+    if not os.path.isfile(key_path):
+        try:
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', key_path], check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            print('无法生成 SSH 密钥。请先在保活服务器安装 openssh-client，再运行 cdt -> s。')
+            return
+    validate_node_ssh(candidate)
+    target = f'{user}@{host}'
+    print('请核对首次连接的主机指纹。ssh-copy-id 会询问节点现有 SSH 密码，密码不会保存。')
+    print('若节点禁止密码登录，请手动把以下公钥加入该节点的 ~/.ssh/authorized_keys：')
+    with open(key_path + '.pub', 'r', encoding='ascii') as public_key:
+        print(public_key.read().strip())
+    try:
+        copied = subprocess.run(['ssh-copy-id', '-i', key_path + '.pub', '-p', str(port), target],
+                                check=False)
+    except FileNotFoundError:
+        print('本机没有 ssh-copy-id；请先安装 openssh-client，或手动添加上面的公钥。')
+        return
+    if copied.returncode:
+        print('公钥尚未安装；请手动添加后再运行 cdt -> s。')
+        return
+    probe = subprocess.run([
+        'ssh', '-T', '-i', key_path, '-p', str(port), '-o', 'BatchMode=yes',
+        '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+        '-o', 'ConnectTimeout=10', target, 'true'
+    ], check=False)
+    if probe.returncode:
+        print('SSH 免密或主机密钥验证未通过；未保存节点 SSH 配置。')
+        return
+    accounts = load_accounts(include_disabled=True)
+    for item in accounts:
+        if account_key(item) == account_key(account):
+            item.update({field: candidate[field] for field in
+                         ('node_ssh_host', 'node_ssh_user', 'node_ssh_port', 'node_ssh_key_path')})
+            save_accounts(accounts)
+            break
+    else:
+        print('账号已变化，未保存节点 SSH 配置。')
+        return
+    print('节点 SSH 已配置；以后换 IP 成功后会用新 EIP 检查 nftables。')
+    try:
+        current_ip = current_eip(candidate)['IpAddress']
+        print('当前节点检查：' + prepare_node_nftables(candidate, current_ip))
+    except Exception as exc:
+        print(f'当前节点自动检查未完成：{exc}。SSH 配置已保存，换 IP 后会重试。')
 
 
 def set_account_enabled_cli(enabled: bool):
@@ -1232,6 +1426,28 @@ def cf_request(account: Dict[str, Any], method: str, path: str, **kwargs) -> Dic
     return data
 
 
+def discover_cf_zone(domain: str, token: str) -> str:
+    domain = normalize_cf_input('cf_domain', domain)
+    for index in range(len(domain.split('.')) - 1):
+        suffix = '.'.join(domain.split('.')[index:])
+        response = requests.get(
+            'https://api.cloudflare.com/client/v4/zones',
+            headers={'Authorization': f'Bearer {token}'},
+            params={'name': suffix, 'per_page': 1}, timeout=20
+        )
+        data = response.json()
+        if not response.ok or not data.get('success'):
+            raise ValueError('无法自动查找区域 ID。请给令牌增加“区域 → 区域 → 读取”权限，或手动填写区域 ID。')
+        if int((data.get('result_info') or {}).get('total_count') or 0) > 1:
+            raise ValueError('这个域名对应多个可见 Cloudflare 区域，请使用只限定目标区域的令牌或手填区域 ID。')
+        for zone in data.get('result') or []:
+            if str(zone.get('name') or '').lower().rstrip('.') == suffix:
+                zone_id = str(zone.get('id') or '')
+                if re.fullmatch(r'[a-fA-F0-9]{32}', zone_id):
+                    return zone_id
+    raise ValueError('令牌可用，但找不到包含此域名的 Cloudflare 区域；请检查令牌的区域范围。')
+
+
 def cf_record(account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     domain = account['cf_domain'].lower().rstrip('.')
     data = cf_request(account, 'GET', 'dns_records', params={
@@ -1336,7 +1552,13 @@ def rotate_one_eip(account: Dict[str, Any]) -> str:
         if cf_record(account).get('content') != new_ip:
             raise ValueError('Cloudflare 更新后回读的 IP 不一致。')
         vpc_action(account, 'ReleaseEipAddress', AllocationId=old_id)
-        return f'✅ {account_name(account)}：{old_ip} → {new_ip}\nCF：{account["cf_domain"]} 已更新，旧 EIP 已释放。'
+        result = f'✅ {account_name(account)}：{old_ip} → {new_ip}\nCF：{account["cf_domain"]} 已更新，旧 EIP 已释放。'
+        try:
+            result += '\n节点检查：' + prepare_node_nftables(account, new_ip)
+        except Exception as exc:
+            logging.warning('节点 nftables 检查失败：%s：%s', account_name(account), exc)
+            result += f'\n⚠ 节点 nftables 未确认：{exc}。换 IP 已成功，请勿重复点击。'
+        return result
     except Exception as exc:
         detail = str(exc)
         recovered = False
@@ -1374,11 +1596,13 @@ def rotate_one_eip(account: Dict[str, Any]) -> str:
         raise RuntimeError(detail) from exc
 
 
-CF_SETUP_FIELDS = ('cf_domain', 'cf_zone_id', 'cf_api_token')
+CF_SETUP_FIELDS = ('cf_domain', 'cf_api_token', 'cf_zone_id')
 CF_SETUP_PROMPTS = {
     'cf_domain': '请输入这台机器对应的完整域名，例如 hk.example.com：',
-    'cf_zone_id': '请输入 Cloudflare Zone ID（32 位，可在域名概览页找到）：',
-    'cf_api_token': '请输入仅授权目标区域 DNS 编辑的 Cloudflare API Token（不是 Global API Key）。发送后机器人会尽量删除这条消息：',
+    'cf_zone_id': '自动识别区域 ID 未成功。可给令牌增加“区域 → 区域 → 读取”权限，或从域名概览页手动输入 32 位区域 ID（不是账户 ID）：',
+    'cf_api_token': ('请先在 https://dash.cloudflare.com/profile/api-tokens 创建 Cloudflare API Token：'
+                     '只选择目标域名所在区域，权限为“区域 → DNS → 编辑”和“区域 → 区域 → 读取”。'
+                     '不要使用 Global API Key。创建后把 Token 发给我；我会尝试删除这条消息：'),
 }
 CF_FIELD_CODES = {'domain': 'cf_domain', 'zone': 'cf_zone_id', 'token': 'cf_api_token'}
 
@@ -1406,6 +1630,19 @@ def save_cf_setting(account: Dict[str, Any], field: str, value: str):
     raise ValueError('账号已变化，请重新选择。')
 
 
+def autofill_cf_zone(account: Dict[str, Any]) -> Optional[str]:
+    domain = account.get('cf_domain')
+    token = account.get('cf_api_token')
+    if not domain or not token:
+        return None
+    try:
+        zone_id = discover_cf_zone(domain, token)
+    except Exception as exc:
+        return str(exc)
+    save_cf_setting(account, 'cf_zone_id', zone_id)
+    return None
+
+
 def cf_config_keyboard(accounts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(account_name(acc), callback_data=f'ip:config:{i}')]
             for i, acc in enumerate(accounts)]
@@ -1425,8 +1662,8 @@ def show_cf_config_panel(context: CallbackContext, chat_id, index: int):
         f'区域 ID：{account.get("cf_zone_id") or "未设置"}\n'
         f'API 令牌：{"已设置" if account.get("cf_api_token") else "未设置"}'
     ), reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton('修改域名', callback_data=f'ip:field:{index}:domain'),
-         InlineKeyboardButton('修改区域 ID', callback_data=f'ip:field:{index}:zone')],
+         [InlineKeyboardButton('修改域名', callback_data=f'ip:field:{index}:domain'),
+          InlineKeyboardButton('手填区域 ID', callback_data=f'ip:field:{index}:zone')],
         [InlineKeyboardButton('更换 API 令牌', callback_data=f'ip:field:{index}:token'),
          InlineKeyboardButton('验证配置', callback_data=f'ip:verify:{index}')],
         [InlineKeyboardButton('返回账号列表', callback_data='ip:configlist')]
@@ -1450,11 +1687,15 @@ def prompt_ip_setup(context: CallbackContext, chat_id):
         if not account:
             state['index'] += 1
             continue
+        if account.get('cf_domain') and account.get('cf_api_token') and not account.get('cf_zone_id'):
+            state['zone_error'] = autofill_cf_zone(account)
+            account = find_account(keys[state['index']], include_disabled=True)
         missing = [field for field in CF_SETUP_FIELDS if not account.get(field)]
         if missing:
             state['field'] = missing[0]
             context.bot.send_message(chat_id=chat_id, text=(
                 f'账号：{account_name(account)}\n尚缺 Cloudflare 配置。\n'
+                + (f'{state.get("zone_error")}\n' if missing[0] == 'cf_zone_id' and state.get('zone_error') else '')
                 + CF_SETUP_PROMPTS[state['field']]
             ))
             return
@@ -1482,7 +1723,8 @@ def prompt_ip_setup(context: CallbackContext, chat_id):
              if find_account(key, include_disabled=True)]
     context.bot.send_message(chat_id=chat_id, text=(
         '准备更换：' + '、'.join(names) + '\n'
-        '会产生新 EIP 费用，解绑/绑定期间短暂断网；成功更新 CF 后才释放旧 EIP。\n确定执行？'
+        '会产生新 EIP 费用，解绑/绑定期间短暂断网；成功更新 CF 后才释放旧 EIP。'
+        '已配置节点 SSH 时，换完会检查 nftables，必要时短暂重启妙妙屋 Agent。\n确定执行？'
     ), reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton('确认换 IP', callback_data='ip:confirm'),
         InlineKeyboardButton('取消', callback_data='ip:cancel')
@@ -1502,7 +1744,8 @@ def prompt_bulk_confirmation(context: CallbackContext, chat_id, accounts: List[D
     context.bot.send_message(chat_id=chat_id, text=(
         f'批量只读预检通过 {len(accounts)} 台：{names}\n'
         '预检无法验证 RAM 写入权限或 EIP 申请配额，实际执行仍可能失败。\n'
-        '会产生新 EIP 费用，解绑/绑定期间短暂断网；成功更新 CF 后才释放旧 EIP。\n确定执行？'
+        '会产生新 EIP 费用，解绑/绑定期间短暂断网；成功更新 CF 后才释放旧 EIP。'
+        '已配置节点 SSH 时，换完会检查 nftables，必要时短暂重启妙妙屋 Agent。\n确定执行？'
     ), reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton('确认换 IP', callback_data='ip:confirm'),
         InlineKeyboardButton('取消', callback_data='ip:cancel')
@@ -1720,17 +1963,21 @@ def ip_setup_message(update: Update, context: CallbackContext):
                 update.message.reply_text('无法删除含令牌的消息，请手动删除并考虑更换令牌。')
         try:
             value = normalize_cf_input(field, update.message.text)
+            if field == 'cf_domain' and value != account.get('cf_domain'):
+                save_cf_setting(account, 'cf_zone_id', '')
             save_cf_setting(account, field, value)
         except ValueError as exc:
             update.message.reply_text(f'{exc}\n请重新输入，或发送 /cancel 取消。')
             return
         context.user_data.pop('ip_edit', None)
         account = find_account(edit['key'], include_disabled=True)
+        zone_error = autofill_cf_zone(account) if field in ('cf_domain', 'cf_api_token') else None
+        account = find_account(edit['key'], include_disabled=True)
         try:
             zone = verify_cf_zone(account)
             result = f'✅ 已保存，Cloudflare 区域 {zone} 与域名匹配。'
         except Exception as exc:
-            result = f'已保存，但 Cloudflare 配置还未通过校验：{exc}'
+            result = f'已保存，但 Cloudflare 配置还未通过校验：{zone_error or exc}'
         update.message.reply_text(result + '\n此操作没有更换 IP。')
         accounts = load_accounts(include_disabled=True)
         index = next((i for i, item in enumerate(accounts)
@@ -1972,6 +2219,9 @@ def main():
             return
         if cmd == '--edit-account':
             edit_account_cli()
+            return
+        if cmd == '--setup-node-ssh':
+            setup_node_ssh_cli()
             return
         if cmd == '--enable-account':
             set_account_enabled_cli(True)

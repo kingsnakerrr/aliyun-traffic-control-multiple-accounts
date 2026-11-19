@@ -10,11 +10,11 @@
 | --- | --- | --- |
 | ECS 区域 ID | 实例真实所在地域；在 ECS 实例详情查看 | 香港 `cn-hongkong`，日本东京 `ap-northeast-1` |
 | 账单接口区域 | 账单 API 接入区域，与 ECS 所在地无关 | 国内版通常 `cn-hangzhou`；国际版通常 `ap-southeast-1` |
-| Cloudflare 区域 ID / Zone ID | 解析主域名的区域 ID，不是 Cloudflare 账户 ID | `example.com` 的概览页 API 区域内复制 |
+| Cloudflare 区域 ID / Zone ID | 解析主域名的区域 ID；正常由机器人自动获取 | 自动获取失败时从 `example.com` 的概览页 API 区域复制 |
 | 阿里云 AccessKey ID + Secret | 调阿里云 ECS、CDT、账单、EIP API | 每个阿里云账号各自的 RAM 用户密钥 |
-| Cloudflare API Token | 改 DNS A 记录 | 只授予目标 Zone 的 DNS 编辑权限 |
+| Cloudflare API Token | 改 DNS A 记录并查 Zone ID | 只授予目标 Zone 的 DNS 编辑、区域读取权限 |
 
-例如机器域名是 `abc.example.com`，Cloudflare Token 的资源范围选择 `example.com`，机器人中的完整域名填 `abc.example.com`，Zone ID 复制 `example.com` 的区域 ID。不能选 `abc.example.com` 当 Zone，除非它本身已在 Cloudflare 单独托管为一个 Zone。
+例如机器域名是 `abc.example.com`，Cloudflare Token 的资源范围选择 `example.com`，机器人中的完整域名填 `abc.example.com`，Zone ID 会自动找到。不能选 `abc.example.com` 当 Zone，除非它本身已在 Cloudflare 单独托管为一个 Zone。
 
 ## 2. 在阿里云找到或创建 RAM 用户
 
@@ -65,18 +65,17 @@
 
 `Forbidden.RAM User not authorized` 或 `vpc:DescribeEipAddresses` 报错：这是**阿里云**权限问题，不是 Cloudflare Token 问题。前述策略必须授权到机器人正在使用的 AccessKey 所属 RAM 用户。只给查询权限可通过预检，但申请/解绑/绑定/释放仍可能失败，因此要确认全部 5 个 `vpc:` 动作。
 
-## 4. 在 Cloudflare 取得 Zone ID 和 API Token
+## 4. 在 Cloudflare 创建受限 API Token
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，选托管主域名，例如 `example.com`。
-2. 进该域名的 **概览 / Overview**，向下找到 **API** 区块，复制 **区域 ID / Zone ID**。同一区块还显示**账户 ID / Account ID**，两者都是 32 位，**不能填错**。机器人会读取 Zone 名称并核对完整域名。
-3. 在 Cloudflare 个人资料的 **API 令牌 / API Tokens → 创建令牌 / Create Token**，可从 `Edit zone DNS` 模板开始，或自行创建自定义令牌。**不要用 Global API Key，也不要填 Account ID 当令牌**。
-4. 权限选 **区域 / Zone → DNS → 编辑 / Edit**；资源范围选 **包括 / Include → 特定区域 / Specific zone → `example.com`**。这表示允许修改 `example.com` Zone 内的 `abc.example.com` 等子域名。当前脚本调用读取 Zone、读取 DNS 记录、写 DNS 记录；Cloudflare API 文档允许 Zone 详情由 DNS Write 访问，DNS 编辑可用于 DNS 读取/写入。若你的令牌策略或控制台额外限制读取，可再加 **区域 / Zone → 区域 / Zone → 读取 / Read**，不要直接放大到所有 Zone。
-5. 完成创建后复制一次性展示的 Token，妥善保管。若忘了或输错，用 Cloudflare 创建新 Token，并在 TG `/cfconfig` 中替换；旧 Token 不再需要时撤销。
-6. 在 Cloudflare **DNS → 记录** 中为每台机器建立一条 A 记录，名称如 `abc`，内容填这台 ECS 当前直绑 EIP。记录在 CF 控制台可能显示 `abc`，机器人里填完整域名 `abc.example.com`。是否开启橙云代理按自己的业务决定；已有记录的代理设置会保留。**不要**让同一个域名对应两台机器。
+2. 在 Cloudflare 个人资料的 **API 令牌 / API Tokens → 创建令牌 / Create Token**，可从 `Edit zone DNS` 模板开始，或自行创建自定义令牌。**不要用 Global API Key**。
+3. 权限选 **区域 / Zone → DNS → 编辑 / Edit** 和 **区域 / Zone → 区域 / Zone → 读取 / Read**；资源范围选 **包括 / Include → 特定区域 / Specific zone → `example.com`**。读取权限仅用于机器人按域名自动查 Zone ID，不需要开放所有 Zone。只有 DNS 编辑权限的旧令牌仍可用，但需要手填 Zone ID。
+4. 完成创建后复制一次性展示的 Token，妥善保管。若忘了或输错，用 Cloudflare 创建新 Token，并在 TG `/cfconfig` 中替换；旧 Token 不再需要时撤销。
+5. 在 Cloudflare **DNS → 记录** 中为每台机器建立一条 A 记录，名称如 `abc`，内容填这台 ECS 当前直绑 EIP。记录在 CF 控制台可能显示 `abc`，机器人里填完整域名 `abc.example.com`。HY2/VLESS 直连节点应使用 **DNS-only（灰云）**；已有记录的代理设置会保留。**不要**让同一个域名对应两台机器。
 
 ## 5. SSH 安装、升级和修改阿里云账号
 
-已有安装直接 SSH 登录服务器，运行 `cdt`，首页选 **x. 一键升级程序**，按提示输入 `yes`。升级会更新主程序、菜单、service 和本教程，不会覆盖 `accounts.json`、通知状态、日志或 venv。升级完成后机器人会重启，等几秒再试 `/guide`。
+已有安装直接 SSH 登录服务器，运行 `cdt`，首页选 **x. 一键升级程序**，按提示输入 `yes`。升级会更新主程序、菜单、service 和本教程，不会覆盖 `accounts.json`、节点 SSH 私钥、通知状态、日志或 venv。升级完成后机器人会重启，等几秒再试 `/guide`。
 
 若旧版 `cdt` 菜单没有 `x`，先运行：
 
@@ -88,19 +87,25 @@ cdt
 
 新增第二个阿里云账号：`cdt → a. 增加账号`。修改现有账号密钥、实例 ID、ECS 地域、账单接口区域或保活开关：`cdt → 输入账号序号 → 8. 编辑这个账号`。对没有改动的字段按回车保留旧值。配置保存在服务器 `/root/aliyun-traffic-control/accounts.json`；不要上传该文件或带有 Telegram 凭证的 `traffic_control.py` 到 GitHub。必要时可在 `cdt → t` 查看服务状态和日志。
 
+### 节点 SSH：每台机器只配置一次
+
+换 EIP 不会卸载节点上的软件。为了让机器人在**新 IP 已绑定**后自动检查并按需安装 `nftables`，先在保活服务器运行 `cdt → s. 配置节点 SSH`，选阿里云账号，填该节点的 **DNS-only 域名**、SSH 用户（通常 root）和端口。缺少 SSH 客户端工具时向导会自动安装。它为该账号生成独立 SSH 密钥，只在保活服务器保存私钥；`ssh-copy-id` 会要求你核对首次连接的主机指纹，并输入一次节点原有 SSH 密码来安装公钥，密码不会保存。节点禁用密码登录时，按向导显示的公钥手动加入节点 `~/.ssh/authorized_keys`，然后重试。不要把私钥发给机器人或放进 GitHub。
+
+配置成功后，向导会立即检查当前节点一次；后续换 IP 会使用新 EIP 与已信任的主机密钥连接，不依赖尚未刷新的 DNS。若节点没有 `nftables`，按系统包管理器安装；若妙妙屋 X 配置了 HY2 跳跃但转发规则未建立，短暂重启 `mmw-agent` 并验证规则。安装/SSH 失败只在换 IP 成功消息后警告，**不会把成功换 IP 误报为失败，也不要重复点击换 IP**。若不配置节点 SSH，换 IP 仍可进行，但不会自动检查 HY2 依赖。保活服务器持有能登录节点的私钥，须限制该服务器的管理员访问权限并妥善备份；当前向导使用节点原有 SSH 用户权限，不是沙箱。
+
 报表里的 **CDT 流量阈值**是你在脚本中设置的停机线，不等于阿里云官方免费额度；费用和实际额度以当前阿里云控制台账单、产品规则为准。超过阈值时脚本会关机，保活不会强行拉起；月初满足流量低于阈值等条件后才会尝试开机。探针离线时先看 `/status` 的流量控制与实例状态、`cdt` 日志，不能仅凭探针断定是保活失效。
 
 ## 6. 在 TG 配置并验证每台机器的 Cloudflare
 
 1. **私聊**机器人，发送 `/cfconfig`，选择账号。机器人只接受配置的管理员私聊。
-2. 点 **修改域名**，填完整域名，例如 `abc.example.com`；点 **修改区域 ID**，填 `example.com` 概览页的 Zone ID；点 **更换 API 令牌**，填仅授权该 Zone DNS 编辑的 Token。每个阿里云账号都要配置对应的域名/Zone/Token；同一 Zone 下的两台机器可以使用同一个受限 Token，但域名必须不同。
+2. 点 **修改域名**，填完整域名，例如 `abc.example.com`；点 **更换 API 令牌**，填仅授权该 Zone DNS 编辑和区域读取的 Token。机器人自动查 Zone ID。若令牌没有区域读取权限，可补权或点 **手填区域 ID**，从目标域名概览页 API 区块复制 Zone ID；不要填旁边的 Account ID。每个阿里云账号的域名必须不同，同一 Zone 可复用受限 Token。
 3. 点 **验证配置**。它只查询 Zone 和 DNS，不会换 IP。验证通过再发送 `/changeip`。若填错，可随时再次 `/cfconfig` 修改任一项；输入到一半发送 `/cancel` 退出，不会被卡在循环。机器人会尝试删除含 Token 的 TG 消息；若删除失败，请自己删除并考虑换 Token。
 
 ## 7. 单账号或批量换 IP
 
 发送 `/changeip`。点某个账号可单独换：尚缺 CF 配置时机器人会逐项询问，完成后再次验证并显示确认。点 **一键更换已配置启用账号**：机器人会对每个**启用**账号做只读预检，只把以下全部通过的账号放进确认清单：阿里云账号字段完整、CF Zone 与域名匹配、能查询当前直绑的普通按量 EIP、CF 中已有唯一 A 记录且记录内容等于旧 EIP。未配置、已禁用、DNS 不一致、EIP 不受支持或查询权限不足的账号会跳过并显示原因；**批量不会跳进配置问答，也不会替你创建缺失的 A 记录**。
 
-确认前核对清单。只读预检**无法验证写权限、配额或新 EIP 的价格**，真正执行仍可能失败。换 IP 会先申请新 EIP，再解绑旧 EIP、绑定新 EIP、更新并回读 CF A 记录，最后释放旧 EIP；中间会短暂断网，可能产生额外费用。出现失败或超时，先查机器人报告的 EIP ID、阿里云控制台绑定状态和 Cloudflare 解析，**不要连续重复点击**。如果不是直绑 ECS EIP，而是固定公网 IP、辅助网卡 EIP、共享带宽或包年包月 EIP，当前机器人不会自动换。
+确认前核对清单。只读预检**无法验证写权限、配额或新 EIP 的价格**，真正执行仍可能失败。换 IP 会先申请新 EIP，再解绑旧 EIP、绑定新 EIP、更新并回读 CF A 记录，最后释放旧 EIP；有节点 SSH 配置时，再用新 IP 检查并按需安装 `nftables`。中间会短暂断网，可能产生额外费用。出现失败或超时，先查机器人报告的 EIP ID、阿里云控制台绑定状态和 Cloudflare 解析，**不要连续重复点击**。如果不是直绑 ECS EIP，而是固定公网 IP、辅助网卡 EIP、共享带宽或包年包月 EIP，当前机器人不会自动换。
 
 ## 8. 常见问题速查
 
@@ -109,6 +114,8 @@ cdt
 | 机器人通知正常，但换 IP 显示“无效” | Telegram 通知与阿里云/CF API 是不同凭证；先用 `/cfconfig` 验证 Zone/Token，再查阿里云 AccessKey、EIP 类型与 RAM 授权。 |
 | Cloudflare `Zone ID` 校验失败 | 核对是否误填 **Account ID**；从目标域名概览页 API 区块重复制；确认 Token 资源范围包含该 Zone。 |
 | CF 记录与旧 EIP 不一致 | 到 CF DNS 核对该机器的 A 记录是否指向当前直绑 EIP；不确认原因前不要强行换。 |
+| 换 IP 成功，但提示节点 nftables 未确认 | 不要再次换 IP；检查保活服务器 `cdt → s` 的 SSH 连通、节点包管理器和 `mmw-agent` 日志。 |
+| HY2 固定端口可用、跳跃端口不通 | 服务器需安装 `nftables`，妙妙屋 Agent 需建立跳跃端口到固定 UDP 端口的规则；可用 `nft list ruleset` 核对。只开放阿里云安全组不够。 |
 | `Forbidden.RAM` 或 `vpc:DescribeEipAddresses` | 查所用 AccessKey 属于哪个主账号、哪个 RAM 用户；给**那个用户**添加 EIP 权限策略。 |
 | 第二个账号 RAM 用户列表为空 | 这个主账号尚未创建 RAM 用户；按第 2 节创建。另一个主账号的用户不会出现在这里。 |
 | 创建了“用于程序访问的超级用户” | 可以复用这个 RAM 用户，但先安全轮换其密钥，再核对授权与机器人里配置的 ID/Secret。不要授权给镜像导入/导出角色。 |
@@ -126,6 +133,7 @@ cdt
 - [阿里云：轮换 AccessKey](https://help.aliyun.com/zh/ram/user-guide/rotate-accesskey-pairs-of-ram-users)
 - [阿里云：AccessKey 泄露处理](https://help.aliyun.com/zh/ram/user-guide/solution-to-accesskey-leakage)
 - [Cloudflare：创建 API Token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+- [Cloudflare：列出 Zone（需要区域读取权限）](https://developers.cloudflare.com/api/resources/zones/methods/list/)
 - [Cloudflare：找到 Account ID 和 Zone ID](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/)
 - [Cloudflare：Zone 详情 API 权限](https://developers.cloudflare.com/api/resources/zones/methods/get/)
 - [Cloudflare：DNS 读取和更新 API 权限](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/list/)

@@ -13,7 +13,8 @@ echo "======================================"
 echo "第一次安装先录入 Telegram 全局配置，再录入 1 个阿里云账号。以后新增账号用命令：cdt -> a。Telegram 配置可在 cdt -> t 修改。"
 echo
 
-read -r -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
+read -r -s -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
+echo
 read -r -p "Telegram 频道/群组 ID，例如 -100xxxx: " TELEGRAM_CHAT_ID
 read -r -p "Telegram 管理员私聊 ID: " ADMIN_USER_ID
 
@@ -22,7 +23,8 @@ echo "===== 第一个阿里云账号 ====="
 read -r -p "账号显示名称，例如 zymsdf-香港: " ACCOUNT_NAME
 ACCOUNT_NAME=${ACCOUNT_NAME:-zymsdf-香港}
 read -r -p "阿里云 ACCESS_KEY_ID: " ACCESS_KEY_ID
-read -r -p "阿里云 ACCESS_KEY_SECRET: " ACCESS_KEY_SECRET
+read -r -s -p "阿里云 ACCESS_KEY_SECRET: " ACCESS_KEY_SECRET
+echo
 read -r -p "ECS 实例 ID: " INSTANCE_ID
 echo "常见 ECS 区域：香港 cn-hongkong，日本东京 ap-northeast-1，新加坡 ap-southeast-1，美国硅谷 us-west-1，美国弗吉尼亚 us-east-1，杭州 cn-hangzhou，上海 cn-shanghai，北京 cn-beijing，深圳 cn-shenzhen。"
 echo "注意：ECS 区域必须填实例真实所在地域。香港填 cn-hongkong，日本东京填 ap-northeast-1。"
@@ -53,9 +55,9 @@ CRON_CHECK="* * * * * ${BASE_DIR}/venv/bin/python ${BASE_DIR}/traffic_control.py
 
 if command -v apt >/dev/null 2>&1; then
   apt update
-  apt install -y python3 python3-venv python3-pip curl ca-certificates cron
+  apt install -y python3 python3-venv python3-pip curl ca-certificates cron openssh-client
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y python3 python3-pip curl ca-certificates cronie
+  yum install -y python3 python3-pip curl ca-certificates cronie openssh-clients
   yum install -y python3-virtualenv || true
 else
   echo "未检测到 apt 或 yum，请先安装 python3、pip、curl 和 cron 后再运行。"
@@ -139,5 +141,6 @@ echo "每日报告时间：${REPORT_TIME} UTC+8 / 北京时间"
 echo "月初自动恢复：每月1号 00:05 UTC+8 后检测，流量低于各账号阈值才开机"
 echo "控制菜单命令：cdt"
 echo "新增账号：cdt -> a"
+echo "节点自动检查 nftables：每个账号先运行一次 cdt -> s 配置 SSH"
 echo "Telegram 配置/测试：cdt -> t"
 echo "======================================"

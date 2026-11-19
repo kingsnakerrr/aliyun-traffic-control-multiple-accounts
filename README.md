@@ -156,15 +156,17 @@ Bot 命令：
 /help
 ```
 
-机器人启动时会刷新 Telegram 左下角命令菜单。`/changeip` 可选单个账号或批量换 IP。单账号缺少 Cloudflare 配置时会逐项询问；批量只选择已启用、配置完整、CF 与当前直绑 EIP 的 A 记录一致且只读预检通过的账号，逐台列出跳过原因，不进入配置问答。预检不能验证 EIP 写权限或配额。Token 消息会尝试删除，但 Telegram 平台仍可能留有记录，建议使用仅限目标 Zone 的 DNS 编辑权限 Token，不要使用 Global API Key。
+机器人启动时会刷新 Telegram 左下角命令菜单。`/changeip` 可选单个账号或批量换 IP。单账号通常只需填写 Cloudflare 完整域名和 API Token，机器人会自动查 Zone ID；自动查不到时可手填。批量只选择已启用、配置完整、CF 与当前直绑 EIP 的 A 记录一致且只读预检通过的账号，逐台列出跳过原因，不进入配置问答。预检不能验证 EIP 写权限或配额。Token 消息会尝试删除，但 Telegram 平台仍可能留有记录。Token 只授权目标 Zone 的 DNS 编辑和区域读取，不要使用 Global API Key。
 
-填错配置时发送 `/cfconfig`，选择账号后可单独修改域名、区域 ID（Zone ID）或 API 令牌；“验证配置”只读检查区域和 DNS，不会换 IP。输入过程中发送 `/cancel` 可退出。换 IP 前也会先确认区域 ID 对应的区域包含该账号域名，避免把账户 ID 误当成区域 ID。
+填错配置时发送 `/cfconfig`，选择账号后可单独修改域名、手填区域 ID（Zone ID）或更换 API 令牌；“验证配置”只读检查区域和 DNS，不会换 IP。输入过程中发送 `/cancel` 可退出。换 IP 前也会确认区域 ID 对应的区域包含该账号域名，避免把账户 ID 误当成区域 ID。
 
 换 IP 仅支持直绑 ECS、未加入共享带宽的按量付费 EIP。固定公网 IP、辅助网卡 EIP、包年包月 EIP 暂不支持，机器人会拒绝操作。每台账号对应一个域名和一个 Zone ID，配置保存在权限为 `0600` 的 `accounts.json` 中；`cdt` 的“查看 accounts.json”会隐藏密钥。
 
-操作顺序：校验旧 EIP 与 CF A 记录（单账号模式若无 A 记录会先创建指向旧 IP 的 DNS-only 记录；批量模式会跳过）→ 申请同地域、同带宽和计费方式的新 EIP → 解绑旧 EIP → 绑定并确认新 EIP → 更新并回读 CF A 记录 → 释放旧 EIP。阿里云不允许同一 ECS 主网卡同时绑定两个 EIP，因此解绑到绑定之间会短暂断网。新 EIP 可能产生费用；如中途失败，机器人会报告保留的 EIP ID 和需要人工核查的状态，不会在 CF 更新失败时释放旧 EIP。Cloudflare 代理设置对已有记录保持不变。
+操作顺序：校验旧 EIP 与 CF A 记录（单账号模式若无 A 记录会先创建指向旧 IP 的 DNS-only 记录；批量模式会跳过）→ 申请同地域、同带宽和计费方式的新 EIP → 解绑旧 EIP → 绑定并确认新 EIP → 更新并回读 CF A 记录 → 释放旧 EIP → 可选节点 `nftables` 检查。阿里云不允许同一 ECS 主网卡同时绑定两个 EIP，因此解绑到绑定之间会短暂断网。新 EIP 可能产生费用；如中途失败，机器人会报告保留的 EIP ID 和需要人工核查的状态，不会在 CF 更新失败时释放旧 EIP。Cloudflare 代理设置对已有记录保持不变。
 
-阿里云 AccessKey 除原有 ECS/CDT/账单权限外，还需 `vpc:DescribeEipAddresses`、`vpc:AllocateEipAddress`、`vpc:UnassociateEipAddress`、`vpc:AssociateEipAddress`、`vpc:ReleaseEipAddress`。Cloudflare Token 需要对应 Zone 的 DNS 编辑权限。若账号 AccessKey 无效，换 IP 会失败，需先修正该账号密钥。
+节点自动检查需在保活服务器对**每个阿里云账号**运行一次 `cdt → s. 配置节点 SSH`：向导生成该账号专用私钥，并通过 `ssh-copy-id` 交互式安装公钥，节点原有 SSH 密码只在该次终端输入，不发给 TG。以后换 IP 成功后机器人用新 EIP 和已信任主机密钥登录节点；已有 `nftables` 就跳过，没有才安装，HY2 跳跃规则缺失时让妙妙屋 Agent 重建。SSH/安装失败会明确警告，但不会把成功的 EIP 更换误报为失败。未配置节点 SSH 时不会远程安装；把 `nftables` 装在保活服务器上不能修复阿里云节点。详情及安全提醒见 [GUIDE.md](GUIDE.md)。
+
+阿里云 AccessKey 除原有 ECS/CDT/账单权限外，还需 `vpc:DescribeEipAddresses`、`vpc:AllocateEipAddress`、`vpc:UnassociateEipAddress`、`vpc:AssociateEipAddress`、`vpc:ReleaseEipAddress`。Cloudflare Token 自动查 Zone ID 时需要对应 Zone 的 DNS 编辑和区域读取权限。RAM 用户不能给自己的 AccessKey 自动提权；按 [GUIDE.md](GUIDE.md) 由账号管理员一次性授权。若 AccessKey 无效，换 IP 会失败，需先修正密钥。
 
 ## 安全逻辑
 

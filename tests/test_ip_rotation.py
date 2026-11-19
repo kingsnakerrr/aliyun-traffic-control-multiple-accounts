@@ -1,5 +1,7 @@
 import importlib.machinery
 import importlib.util
+import subprocess
+import tempfile
 import sys
 import types
 import unittest
@@ -100,6 +102,45 @@ class RotationTests(unittest.TestCase):
             save.assert_called_once_with(ACCOUNT, 'cf_zone_id', 'b' * 32)
         self.assertNotIn('ip_edit', context.user_data)
         self.assertIn('API 令牌：已设置', context.bot.send_message.call_args.kwargs['text'])
+
+    def test_cf_zone_is_discovered_from_scoped_token(self):
+        empty = Mock(ok=True)
+        empty.json.return_value = {'success': True, 'result': []}
+        found = Mock(ok=True)
+        found.json.return_value = {'success': True, 'result': [{'name': 'example.com', 'id': 'b' * 32}]}
+        with patch.object(app.requests, 'get', side_effect=[empty, found]) as get:
+            zone_id = app.discover_cf_zone('hk.example.com', 'test-token')
+        self.assertEqual(zone_id, 'b' * 32)
+        self.assertEqual([call.kwargs['params']['name'] for call in get.call_args_list],
+                         ['hk.example.com', 'example.com'])
+
+    def test_cf_setup_auto_fills_zone_id(self):
+        account = dict(ACCOUNT, cf_zone_id='')
+        key = app.account_key(account)
+        context = Mock(user_data={})
+        context.user_data = {'ip_setup': {'keys': [key], 'index': 0}, 'ip_targets': [key]}
+
+        def save(_account, field, value):
+            account[field] = value
+
+        with (patch.object(app, 'find_account', return_value=account),
+              patch.object(app, 'discover_cf_zone', return_value='b' * 32),
+              patch.object(app, 'save_cf_setting', side_effect=save)):
+            app.prompt_ip_setup(context, 123)
+        self.assertEqual(account['cf_zone_id'], 'b' * 32)
+        self.assertNotIn('ip_setup', context.user_data)
+        self.assertIn('确定执行', context.bot.send_message.call_args.kwargs['text'])
+
+    def test_cf_setup_falls_back_to_manual_zone_id(self):
+        account = dict(ACCOUNT, cf_zone_id='')
+        key = app.account_key(account)
+        context = Mock(user_data={})
+        context.user_data = {'ip_setup': {'keys': [key], 'index': 0}, 'ip_targets': [key]}
+        with (patch.object(app, 'find_account', return_value=account),
+              patch.object(app, 'discover_cf_zone', side_effect=ValueError('缺少 Zone Read'))):
+            app.prompt_ip_setup(context, 123)
+        self.assertEqual(context.user_data['ip_setup']['field'], 'cf_zone_id')
+        self.assertIn('缺少 Zone Read', context.bot.send_message.call_args.kwargs['text'])
 
     def test_cancel_clears_pending_input(self):
         context = Mock(user_data={})
@@ -261,6 +302,112 @@ class RotationTests(unittest.TestCase):
             'AllocateEipAddress', 'UnassociateEipAddress',
             'AssociateEipAddress', 'PATCH', 'ReleaseEipAddress'
         ])
+
+    def test_node_nftables_uses_new_ip_and_skips_installed_package(self):
+        account = dict(ACCOUNT, node_ssh_host='hk.example.com', node_ssh_user='root',
+                       node_ssh_port=22, node_ssh_key_path=str(source))
+        completed = subprocess.CompletedProcess([], 0, 'NFT_PRESENT\nHOP_READY\n', '')
+        with patch.object(app.subprocess, 'run', return_value=completed) as run:
+            result = app.prepare_node_nftables(account, '198.51.100.20')
+        self.assertIn('跳跃规则正常', result)
+        command = run.call_args.args[0]
+        self.assertIn('root@198.51.100.20', command)
+        self.assertIn('HostKeyAlias=hk.example.com', command)
+        self.assertIn('StrictHostKeyChecking=yes', command)
+        self.assertIn('apk add --no-cache nftables', run.call_args.kwargs['input'])
+
+    def test_node_nftables_reports_new_install(self):
+        account = dict(ACCOUNT, node_ssh_host='hk.example.com', node_ssh_user='root',
+                       node_ssh_port=22, node_ssh_key_path=str(source))
+        completed = subprocess.CompletedProcess([], 0, 'NFT_INSTALLED\nHOP_READY\n', '')
+        with patch.object(app.subprocess, 'run', return_value=completed):
+            self.assertIn('已安装', app.prepare_node_nftables(account, '198.51.100.20'))
+
+    def test_node_nftables_retries_new_ip_ssh_connection(self):
+        account = dict(ACCOUNT, node_ssh_host='hk.example.com', node_ssh_user='root',
+                       node_ssh_port=22, node_ssh_key_path=str(source))
+        unavailable = subprocess.CompletedProcess([], 255, '', 'connection refused')
+        ready = subprocess.CompletedProcess([], 0, 'NFT_PRESENT\nHOP_READY\n', '')
+        with (patch.object(app.subprocess, 'run', side_effect=[unavailable, unavailable, ready]) as run,
+              patch.object(app.time, 'sleep') as sleep):
+            result = app.prepare_node_nftables(account, '198.51.100.20')
+        self.assertIn('跳跃规则正常', result)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_node_ssh_setup_generates_per_account_key_and_saves_only_after_probe(self):
+        account = dict(ACCOUNT)
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                if command[0] == 'ssh-keygen':
+                    Path(command[-1]).write_text('private', encoding='ascii')
+                    Path(command[-1] + '.pub').write_text('ssh-ed25519 test public', encoding='ascii')
+                return subprocess.CompletedProcess(command, 0)
+
+            with (patch.object(app, 'NODE_SSH_DIR', tmp),
+                  patch.object(app, 'get_selected_account_cli', return_value=account),
+                  patch.object(app, 'prompt', side_effect=['hk.example.com', 'root', '22']),
+                  patch.object(app.subprocess, 'run', side_effect=run),
+                  patch.object(app, 'load_accounts', return_value=[account]),
+                  patch.object(app, 'save_accounts') as save,
+                  patch.object(app, 'current_eip', return_value=OLD),
+                  patch.object(app, 'prepare_node_nftables', return_value='已安装')):
+                app.setup_node_ssh_cli()
+            self.assertEqual([cmd[0] for cmd in calls], ['ssh-keygen', 'ssh-copy-id', 'ssh'])
+            self.assertEqual(account['node_ssh_host'], 'hk.example.com')
+            self.assertTrue(account['node_ssh_key_path'].startswith(tmp))
+            save.assert_called_once()
+
+    def test_node_ssh_setup_does_not_save_failed_copy(self):
+        account = dict(ACCOUNT)
+        with tempfile.TemporaryDirectory() as tmp:
+            def run(command, **kwargs):
+                if command[0] == 'ssh-keygen':
+                    Path(command[-1]).write_text('private', encoding='ascii')
+                    Path(command[-1] + '.pub').write_text('ssh-ed25519 test public', encoding='ascii')
+                return subprocess.CompletedProcess(command, 1 if command[0] == 'ssh-copy-id' else 0)
+
+            with (patch.object(app, 'NODE_SSH_DIR', tmp),
+                  patch.object(app, 'get_selected_account_cli', return_value=account),
+                  patch.object(app, 'prompt', side_effect=['hk.example.com', 'root', '22']),
+                  patch.object(app.subprocess, 'run', side_effect=run),
+                  patch.object(app, 'save_accounts') as save):
+                app.setup_node_ssh_cli()
+            save.assert_not_called()
+
+    def test_node_ssh_rejects_command_like_host(self):
+        account = dict(ACCOUNT, node_ssh_host='-oProxyCommand=bad', node_ssh_key_path=str(source))
+        with self.assertRaisesRegex(ValueError, 'SSH 地址'):
+            app.validate_node_ssh(account)
+
+    def test_node_nftables_failure_does_not_turn_rotation_into_failure(self):
+        calls = []
+        record = {'id': 'dns-1', 'content': OLD['IpAddress']}
+
+        def vpc(_account, action, **kwargs):
+            calls.append(action)
+            if action == 'AllocateEipAddress':
+                return {'AllocationId': 'eip-new', 'EipAddress': '198.51.100.20'}
+            return {}
+
+        def cf(_account, method, path, **kwargs):
+            if method == 'PATCH':
+                record['content'] = kwargs['json']['content']
+            return {}
+
+        with (patch.object(app, 'current_eip', return_value=OLD),
+              patch.object(app, 'cf_record', return_value=record),
+              patch.object(app, 'vpc_action', side_effect=vpc),
+              patch.object(app, 'cf_request', side_effect=cf),
+              patch.object(app, 'wait_eip', return_value={}),
+              patch.object(app, 'prepare_node_nftables', side_effect=ValueError('SSH 不可达'))):
+            result = app.rotate_one_eip(ACCOUNT)
+        self.assertIn('换 IP 已成功', result)
+        self.assertIn('nftables 未确认', result)
+        self.assertEqual(calls[-1], 'ReleaseEipAddress')
 
     def test_bind_failure_rebinds_old_and_releases_new(self):
         calls = []

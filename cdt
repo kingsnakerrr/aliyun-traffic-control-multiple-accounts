@@ -46,10 +46,24 @@ edit_accounts_json(){ ${EDITOR:-nano} "$ACCOUNTS_FILE"; echo "修改完成后建
 edit_config(){ ${EDITOR:-nano} "$APP"; echo "修改完成后建议重启服务：systemctl restart traffic-control"; }
 backup_accounts(){ cp -a "$ACCOUNTS_FILE" "${ACCOUNTS_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true; echo "已备份 accounts.json 到同目录 .bak 文件"; }
 account_count(){ run_app --account-count 2>/dev/null || echo 0; }
+ensure_ssh_client(){
+  if command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 && command -v ssh-copy-id >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "正在安装节点 SSH 配置所需的客户端工具..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq && apt-get install -y -qq openssh-client
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y openssh-clients
+  else
+    echo "请先安装 OpenSSH 客户端（ssh、ssh-keygen、ssh-copy-id）。"
+    return 1
+  fi
+}
 
 upgrade_program(){
   echo "一键升级会更新主程序、cdt 菜单、systemd service 和操作教程。"
-  echo "不会覆盖 accounts.json、通知状态、日志或 venv。"
+  echo "不会覆盖 accounts.json、节点 SSH 私钥、通知状态、日志或 venv。"
   read -r -p "确定升级？输入 yes 继续: " ans
   [ "$ans" = "yes" ] || { echo "已取消升级"; return; }
 
@@ -364,6 +378,7 @@ main_menu(){
     echo "输入账号序号：进入该账号单独控制"
     echo "a. 增加账号"
     echo "d. 删除账号"
+    echo "s. 配置节点 SSH（换 IP 后自动检查 nftables）"
     echo "t. TG Bot / 日志"
     echo "x. 一键升级程序"
     echo "u. 完全卸载程序"
@@ -374,6 +389,7 @@ main_menu(){
       0) exit 0;;
       a|A) run_app --add-account; restart_bot_quiet; pause;;
       d|D) run_app --delete-account; restart_bot_quiet; pause;;
+      s|S) if ensure_ssh_client; then run_app --setup-node-ssh; fi; pause;;
       t|T) telegram_menu;;
       x|X) upgrade_program; pause;;
       u|U) uninstall_all;;
